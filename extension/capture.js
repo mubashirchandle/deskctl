@@ -171,10 +171,13 @@ function iconName(icon) {
 
 function describe(actor) {
     const node = {type: actor.constructor.$gtype?.name ?? actor.constructor.name};
-    const [x, y] = actor.get_transformed_position();
-    const [width, height] = actor.get_transformed_size();
-    if ([x, y, width, height].every(Number.isFinite))
-        node.rect = [x, y, width, height].map(Math.round);
+    // Extents follow the allocation; get_transformed_size() follows the paint
+    // volume, which CSS shadows and icon padding distort.
+    if (actor.mapped) {
+        const extents = actor.get_transformed_extents();
+        node.rect = [extents.get_x(), extents.get_y(), extents.get_width(), extents.get_height()]
+            .map(Math.round);
+    }
     if (actor.name)
         node.name = actor.name;
     if (actor instanceof St.Widget) {
