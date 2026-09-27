@@ -156,9 +156,11 @@ class TreeRenderTests(unittest.TestCase):
 
 
 class ErrorMappingTests(unittest.TestCase):
-    def translate(self, name, message='boom', sandbox=None):
+    def translate(self, name, message='boom', sandbox=None, locked=False):
         target = deskctl.Target.__new__(deskctl.Target)
         target.sandbox, target.label = sandbox, 'live'
+        target.bus = mock.Mock()
+        target.bus.call_sync.return_value.unpack.return_value = (locked,)
         return target._translate(Gio.DBusError.new_for_dbus_error(name, message))
 
     def test_extension_errors(self):
@@ -173,6 +175,12 @@ class ErrorMappingTests(unittest.TestCase):
         error = self.translate('org.freedesktop.DBus.Error.UnknownObject')
         self.assertEqual(error.status, deskctl.EXIT_UNAVAILABLE)
         self.assertIn('gnome-extensions enable deskctl@local', str(error))
+
+    def test_locked_screen_is_not_a_missing_extension(self):
+        # GNOME unloads user extensions on the lock screen, so the object vanishes.
+        error = self.translate('org.freedesktop.DBus.Error.UnknownObject', locked=True)
+        self.assertEqual(error.status, deskctl.EXIT_LOCKED)
+        self.assertIn('locked', str(error))
 
 
 class SandboxIsolationTests(unittest.TestCase):

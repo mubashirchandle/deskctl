@@ -24,7 +24,8 @@ Run `deskctl --help` or `deskctl COMMAND --help` for all flags.
   the message says how far it got). Stop and tell them. Never re-enable it yourself: don't click that toggle,
   open the extension's preferences, or touch the `org.gnome.shell.extensions.deskctl`
   `enabled` key. Status 3 means the extension or
-  sandbox isn't running; 5 locked session; 6 not found; 7 timeout; 2 bad arguments.
+  sandbox isn't running; 5 locked session (nothing works until the user unlocks; stop and tell
+  them, never try to unlock); 6 not found; 7 timeout; 2 bad arguments.
 - Input goes to the real desktop. Don't type into windows you didn't intend to, and never type
   passwords or interact with authentication dialogs.
 

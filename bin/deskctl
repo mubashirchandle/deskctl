@@ -317,6 +317,9 @@ class Target:
             code = remote[len(ERROR_PREFIX):]
             return DeskctlError(message, REMOTE_EXIT.get(code, EXIT_FAILED))
         if remote in UNAVAILABLE_ERRORS:
+            if self._screen_locked():
+                return DeskctlError(f'The session on {self.label} is locked; GNOME unloads '
+                                    'extensions on the lock screen', EXIT_LOCKED)
             hint = ('start it with `deskctl sandbox start`' if self.sandbox else
                     'install it, log out and back in, then `gnome-extensions enable deskctl@local`')
             return DeskctlError(f'The {UUID} extension is not active on {self.label} ({message}); '
@@ -325,6 +328,15 @@ class Target:
                 remote == 'org.freedesktop.DBus.Error.NoReply':
             return DeskctlError(f'Timed out waiting for GNOME Shell: {message}', EXIT_TIMEOUT)
         return DeskctlError(message)
+
+    def _screen_locked(self):
+        try:
+            return self.bus.call_sync(
+                'org.gnome.ScreenSaver', '/org/gnome/ScreenSaver', 'org.gnome.ScreenSaver',
+                'GetActive', None, GLib.VariantType('(b)'), Gio.DBusCallFlags.NONE,
+                2000, None).unpack()[0]
+        except GLib.Error:
+            return False
 
     def state(self):
         return self.call('GetState')
