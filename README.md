@@ -100,8 +100,9 @@ toggle give you visibility and control over agents. Sandboxed Flatpak apps can't
   - `--full-res` keeps physical pixels.
   - `--grid [STEP]` overlays labelled coordinate lines.
 - **Workspaces** are numbered from 1, like Super+1. Monitors are indexed from 0.
-- **Settling:** action commands wait for workspace, overview and window animations to finish
-  before returning (`--no-settle` to skip).
+- **Settling:** action commands wait for workspace, overview and window animations, and then for
+  the screen to stop repainting (so menus finish opening), before returning. That last wait is
+  capped at ¾ s, so a playing video can't stall them. Use `--no-settle` to skip it.
 - **Workspace restore:** `screenshot --workspace N` switches back by workspace identity, not
   number. Dynamic workspaces renumber when an empty one vanishes, and the metadata reports whether
   the restore was exact.
@@ -129,7 +130,10 @@ agent-oriented guide.
   under `~/.cache/deskctl/sandbox/NAME`.
 
 Before starting the shell it writes a canary key and refuses to continue unless the key landed in
-the sandbox's own database.
+the sandbox's own database. It returns only once the sandbox is ready for input: GNOME Shell
+ignores keyboard shortcuts for a few seconds after starting, so `start` presses the Quick Settings
+shortcut until its menu opens. It also moves the pointer out of the top-left hot corner, where
+it starts. Expect about 2.5 s.
 
 | Option | Effect |
 |---|---|
@@ -159,7 +163,8 @@ string.
 | Screen captures | `Shell.Screenshot.screenshot_stage_to_content` + `composite_to_stream` |
 | Window captures | `paint_to_content`, cropped to the frame rect, the same approach as GNOME's screenshot UI |
 | Input | Clutter virtual keyboard and pointer, so compositor keybindings fire exactly as for hardware |
-| Settling | Polls the overview, workspace-switch and window-manager animation state, then waits for redraws |
+| Settling | Polls the overview, workspace-switch and window-manager animation state, then waits for a short stretch with no stage repaints |
+| Indicator | A Quick Settings `SystemIndicator` (status-area icon) with an `Agents` `QuickMenuToggle`, like the built-in toggles |
 
 The CLI adds downscaling, grids, diffs (`magick compare`), dconf snapshots, journal filtering and
 sandbox management.
