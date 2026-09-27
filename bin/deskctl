@@ -180,6 +180,16 @@ def parse_dconf_dump(text):
     return flat
 
 
+def format_dconf_dump(flat):
+    """Inverse of parse_dconf_dump, in the keyfile format `dconf load` reads."""
+    sections = {}
+    for key, value in flat.items():
+        path, name = key.rsplit('/', 1)
+        sections.setdefault(path.strip('/') or '/', []).append(f'{name}={value}')
+    return ''.join(f'[{section}]\n' + '\n'.join(lines) + '\n\n'
+                   for section, lines in sorted(sections.items()))
+
+
 def diff_settings(old, new):
     changed = {k: {'old': old[k], 'new': new[k]} for k in sorted(old.keys() & new.keys())
                if old[k] != new[k]}
@@ -512,10 +522,9 @@ class Sandbox:
         try:
             self._wait(lambda: (self.runtime / 'bus').exists(), 5, 'the sandbox bus')
             self._check_isolation(env)
+            skipped = []
             if seed:
-                dump = subprocess.run(['dconf', 'dump', '/'], capture_output=True, text=True,
-                                      check=True).stdout
-                self._dconf(env, 'load', '/', input_text=dump)
+                skipped = self._seed(env)
                 enabled = self._dconf(env, 'read', '/org/gnome/shell/enabled-extensions').stdout
                 existing = re.findall(r"'([^']+)'", enabled)
                 uuids = existing + [u for u in uuids if u not in existing]
@@ -564,9 +573,26 @@ class Sandbox:
         if not keep_overview:
             target.call('Overview', '(s)', ('hide',))
             target.settle()
-        return {'sandbox': self.name, 'size': size, 'scale': scale or 1, 'display': self.display,
-                'address': state['address'], 'log': str(self.log),
-                'extensions': info, 'state': target.state()}
+        result = {'sandbox': self.name, 'size': size, 'scale': scale or 1,
+                  'display': self.display, 'address': state['address'], 'log': str(self.log),
+                  'extensions': info, 'state': target.state()}
+        if skipped:
+            result['seed_skipped_locked_keys'] = skipped
+        return result
+
+    def _seed(self, env):
+        """Copy the real dconf database in, minus keys system policy has locked."""
+        dump = subprocess.run(['dconf', 'dump', '/'], capture_output=True, text=True,
+                              check=True).stdout
+        locks = self._dconf(env, 'list-locks', '/').stdout.split()
+        flat = parse_dconf_dump(dump)
+        skipped = sorted(key for key in flat if any(
+            key == lock or (lock.endswith('/') and key.startswith(lock)) for lock in locks))
+        result = self._dconf(env, 'load', '/', input_text=format_dconf_dump(
+            {k: v for k, v in flat.items() if k not in skipped}))
+        if result.returncode:
+            raise DeskctlError(f'Seeding sandbox settings failed: {result.stderr.strip()}')
+        return skipped
 
     def _apply_scale(self, target, scale):
         """Scale the virtual monitor through Mutter's DisplayConfig, as Settings does."""
