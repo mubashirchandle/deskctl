@@ -57,18 +57,25 @@ sandbox first. `./uninstall.sh` stops sandboxes and removes only the links it cr
 
 ## Safety model
 
-**Indicator.** An eye icon in the top bar is always present. It is dim when idle and turns red
-while an agent captures the screen, lists windows, reads the shell tree or injects input.
+**Indicator.** An eye icon sits in the system status area, next to Wi-Fi, volume and battery.
+It turns red while an agent captures the screen, lists windows, reads the shell tree or injects
+input, and is crossed out while access is off. The extension's preferences choose when it shows:
 
-**Kill switch.** Its menu has an **Allow agent access** switch and shows the last action with
-the calling process. When the switch is off:
+| Setting | Icon shown |
+|---|---|
+| Always (default) | At all times |
+| When access is allowed | Only while agent access is on |
+| While an agent is using it | Only during agent activity, and for 2 s after |
+
+**Kill switch.** Quick Settings (click the status area) has an **Agents** toggle. It is always
+there, whatever the icon setting. Expanding it shows the last five agent actions with the
+calling program (`claude`, `codex`, …) and a link to the preferences. When the toggle is off:
 - every method except `GetState` fails,
 - `deskctl` exits with status 4,
 - the agent skill tells agents to stop and ask you.
 
-No D-Bus method can turn access back on. Only the menu can, or
-`gsettings set org.gnome.shell.extensions.deskctl enabled true` using the extension's schema
-directory.
+No D-Bus method can turn access back on. Only the toggle can, or the preferences window
+(`gnome-extensions prefs deskctl@local`).
 
 **API scope.** The API has no way to run commands, evaluate code or open files.
 - Screenshots are written to a file descriptor the caller passes in.
@@ -76,8 +83,8 @@ directory.
 - User extensions are unloaded on the lock screen, so nothing works while locked.
 
 **What this is not.** It is not a security boundary against other programs running as you. Any
-such program could already edit your dotfiles or install its own extension. The indicator and
-switch give you visibility and control over agents. Sandboxed Flatpak apps can't reach
+such program could already edit your dotfiles or install its own extension. The icon and
+toggle give you visibility and control over agents. Sandboxed Flatpak apps can't reach
 `org.gnome.Shell` at all.
 
 ## Conventions

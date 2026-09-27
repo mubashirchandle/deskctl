@@ -18,16 +18,17 @@ tests/smoke.sh
 - sandbox environment isolation
 - invariants between the extension and the CLI:
   - every D-Bus method has a handler, and the CLI calls only real methods
-  - only the indicator writes the kill switch
+  - only the Quick Settings toggle and the preferences window write the kill switch
   - the extension has no command, eval or file-open surface
 
-`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 23 checks:
+`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 32 checks:
 
 - screenshots at logical and full resolution
 - workspaces and exact restore
 - app launch, typing and diffing
 - the overlay key
 - the panel tree
+- the status-area icon, the Quick Settings toggle and all three icon visibility settings
 - pointer accuracy
 - the kill switch
 - the shell log
@@ -65,13 +66,15 @@ deskctl tree panel | head                  # your panel, as text
 journalctl --user -b _COMM=gnome-shell | grep -i deskctl   # no errors
 ```
 
-Then check the indicator:
+Then check the icon and toggle:
 
-1. The eye in the top bar turns red during the screenshot commands.
-2. Its menu shows the last action and the calling process.
-3. Turning **Allow agent access** off makes `deskctl screenshot` exit with status 4, while
+1. The eye next to Wi-Fi and battery turns red during the screenshot commands.
+2. In Quick Settings, expanding **Agents** lists recent actions with the calling program.
+3. Turning **Agents** off makes `deskctl screenshot` exit with status 4, while
    `deskctl status` still reports `"enabled": false`.
 4. Turning it back on restores access.
+5. In the preferences (**Settings** in that menu), each **Show icon** option behaves as
+   described; `deskctl status` reports it under `indicator`.
 
 ## Troubleshooting
 
@@ -79,7 +82,7 @@ Then check the indicator:
 |---|---|
 | Exit 3, "extension is not active" | Log out and back in after the first install, then `gnome-extensions enable deskctl@local` |
 | `gnome-extensions info` shows ERROR | `journalctl --user -b _COMM=gnome-shell \| grep -A5 deskctl` |
-| Exit 4 | Agent access is switched off in the top-bar menu (intended) |
+| Exit 4 | Agent access is switched off in Quick Settings (intended) |
 | Sandbox start times out | Read `~/.cache/deskctl/sandbox/NAME/shell.log` |
 | `--scale` rejected | That size doesn't support the scale; the error lists the supported ones |
 | Screenshot of a window on another workspace fails | Use `--workspace N` (switches, captures and restores) |

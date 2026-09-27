@@ -28,10 +28,13 @@ check() {
 }
 size() { magick identify -format '%wx%h' "$1"; }
 sandbox_env() { "$D" sandbox env --name "$name" | sed 's/^export //'; }
-kill_switch() {
+ext_setting() {
     env $(sandbox_env) gsettings --schemadir extension/schemas \
-        set org.gnome.shell.extensions.deskctl enabled "$1"
+        set org.gnome.shell.extensions.deskctl "$1" "$2"
 }
+kill_switch() { ext_setting enabled "$1"; }
+indicator() { "$D" status | jq -c '.indicator'; }
+idle() { sleep 2.5; }  # Activity keeps the indicator "in use" for 2 s.
 
 real_before=$(dconf dump / | sha256sum)
 "$D" sandbox start --name "$name" --fresh --size 1600x1000 --scale 1.25 >"$tmp/start.json"
@@ -76,7 +79,27 @@ check 'screenshot on another workspace restores exactly' \
     jq -e '.restored_workspace.exact and .workspace == 2' <(sed -n 2p "$tmp/ws2.txt")
 check 'still on workspace 1' jq -e '.workspace.active == 1' <("$D" status)
 
+check 'eye icon sits in the system status area' \
+    grep -qE '^ {12}StIcon .*icon=view-reveal-symbolic' <("$D" tree panel | sed -n '/QuickSettings/,$p')
+"$D" key super+s >/dev/null
+check 'Quick Settings has the Agents toggle' \
+    grep -qE 'AgentAccessToggle .*:checked' <("$D" tree quick-settings --depth 30)
+"$D" key Escape >/dev/null
+idle
+check 'default visibility: always shown' jq -e '.visible and (.agent_active | not)' <(indicator)
+ext_setting indicator-visibility active
+check '"active" mode hides the idle icon' jq -e '.visible | not' <(indicator)
+"$D" windows >/dev/null
+check '"active" mode shows the icon while in use' jq -e '.visible and .agent_active' <(indicator)
+idle
+check '"active" mode hides it again afterwards' jq -e '.visible | not' <(indicator)
+ext_setting indicator-visibility enabled
+check '"enabled" mode shows it while allowed' jq -e '.visible' <(indicator)
 kill_switch false
+check '"enabled" mode hides it when switched off' jq -e '.visible | not' <(indicator)
+ext_setting indicator-visibility always
+check '"always" mode shows it even when switched off' jq -e '.visible' <(indicator)
+
 set +e
 "$D" screenshot -o "$tmp/blocked.png" >/dev/null 2>&1
 status=$?
