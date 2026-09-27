@@ -870,7 +870,13 @@ def cmd_screenshot(target, args):
         meta['workspace'] = target.state()['workspace']['active']
     finally:
         if restore is not None:
-            meta_restore = target.restore_workspace(restore)
+            try:
+                meta_restore = target.restore_workspace(restore)
+            except DeskctlError as error:
+                if error.status != EXIT_DISABLED:
+                    raise
+                raise DeskctlError(f'{error}; could not return to workspace '
+                                   f'{restore["active"]}', EXIT_DISABLED) from None
     if restore is not None:
         meta['restored_workspace'] = meta_restore
 

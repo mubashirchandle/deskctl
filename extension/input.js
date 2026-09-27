@@ -32,19 +32,42 @@ function keyval(name) {
 
 // Virtual devices go through the same input path as hardware, so compositor
 // keybindings (overlay key, custom shortcuts) fire exactly as for a user.
+//
+// Every key and button currently held is tracked, and each action checks
+// between steps whether it has been aborted, so switching agent access off
+// stops typing or a drag at once and never leaves anything pressed.
 export class Input {
     constructor(sources) {
         this._sources = sources;
         this._keyboard = null;
         this._pointer = null;
+        this._heldKeys = new Set();
+        this._heldButtons = new Set();
+        this._generation = 0;
     }
 
     destroy() {
+        this.abort();
         // Matches ui/keyboard.js: disposing releases anything still held.
         this._keyboard?.run_dispose();
         this._pointer?.run_dispose();
         this._keyboard = null;
         this._pointer = null;
+    }
+
+    get held() {
+        return {keys: this._heldKeys.size, buttons: this._heldButtons.size};
+    }
+
+    // Stops in-flight actions at their next step and releases everything held.
+    abort() {
+        this._generation++;
+        for (const value of this._heldKeys)
+            this._keyboard?.notify_keyval(now(), value, Clutter.KeyState.RELEASED);
+        for (const button of this._heldButtons)
+            this._pointer?.notify_button(now(), button, Clutter.ButtonState.RELEASED);
+        this._heldKeys.clear();
+        this._heldButtons.clear();
     }
 
     _device(type) {
@@ -61,11 +84,25 @@ export class Input {
         return this._pointer;
     }
 
-    async _tap(value) {
-        this.keyboard.notify_keyval(now(), value, Clutter.KeyState.PRESSED);
-        await this._sources.sleep(KEY_GAP_MS);
-        this.keyboard.notify_keyval(now(), value, Clutter.KeyState.RELEASED);
-        await this._sources.sleep(KEY_GAP_MS);
+    _key(value, pressed) {
+        this.keyboard.notify_keyval(now(), value,
+            pressed ? Clutter.KeyState.PRESSED : Clutter.KeyState.RELEASED);
+        this._heldKeys[pressed ? 'add' : 'delete'](value);
+    }
+
+    _button(button, pressed) {
+        this.pointer.notify_button(now(), button,
+            pressed ? Clutter.ButtonState.PRESSED : Clutter.ButtonState.RELEASED);
+        this._heldButtons[pressed ? 'add' : 'delete'](button);
+    }
+
+    // Waits between steps; throws if abort() ran meanwhile.
+    async _step(ms, generation, progress) {
+        await this._sources.sleep(ms);
+        if (generation !== this._generation) {
+            throw new DeskctlError('Disabled',
+                `Agent access was switched off mid-action; stopped${progress ? ` ${progress()}` : ''}`);
+        }
     }
 
     async keys(combos) {
@@ -77,19 +114,26 @@ export class Input {
                 throw new DeskctlError('InvalidArgs', `A combo has 1..${MAX_COMBO_KEYS} keys`);
             return combo.map(keyval);
         });
+        const generation = this._generation;
+        let done = 0;
+        const progress = () => `after ${done} of ${combos.length} combos`;
         for (const values of resolved) {
             const pressed = [];
             try {
                 for (const value of values) {
-                    this.keyboard.notify_keyval(now(), value, Clutter.KeyState.PRESSED);
+                    this._key(value, true);
                     pressed.push(value);
-                    await this._sources.sleep(KEY_GAP_MS);
+                    await this._step(KEY_GAP_MS, generation, progress);
                 }
             } finally {
-                for (const value of pressed.reverse())
-                    this.keyboard.notify_keyval(now(), value, Clutter.KeyState.RELEASED);
+                // After an abort these were already released.
+                if (generation === this._generation) {
+                    for (const value of pressed.reverse())
+                        this._key(value, false);
+                }
             }
-            await this._sources.sleep(KEY_GAP_MS * 4);
+            done++;
+            await this._step(KEY_GAP_MS * 4, generation, progress);
         }
         return {combos: combos.length};
     }
@@ -99,8 +143,16 @@ export class Input {
             throw new DeskctlError('InvalidArgs', `Text must be 1..${MAX_TEXT} characters`);
         const values = [...text].map(char => SPECIAL_CHARS[char] ??
             Clutter.unicode_to_keysym(char.codePointAt(0)));
-        for (const value of values)
-            await this._tap(value);
+        const generation = this._generation;
+        let typed = 0;
+        const progress = () => `after ${typed} of ${values.length} characters`;
+        for (const value of values) {
+            this._key(value, true);
+            typed++; // The character appears on press.
+            await this._step(KEY_GAP_MS, generation, progress);
+            this._key(value, false);
+            await this._step(KEY_GAP_MS, generation, progress);
+        }
         return {characters: values.length};
     }
 
@@ -113,9 +165,10 @@ export class Input {
     }
 
     async pointerAction(action, args) {
+        const generation = this._generation;
         if (args.x !== undefined || args.y !== undefined) {
             this._checkPoint(args.x, args.y);
-            await this._moveTo(args.x, args.y);
+            await this._moveTo(args.x, args.y, generation);
         }
         if (action === 'move')
             return this._position();
@@ -125,13 +178,15 @@ export class Input {
                 [args.dy ?? 0, Clutter.ScrollDirection.DOWN, Clutter.ScrollDirection.UP],
                 [args.dx ?? 0, Clutter.ScrollDirection.RIGHT, Clutter.ScrollDirection.LEFT],
             ];
-            for (const [amount, positive, negative] of steps) {
+            for (const [amount] of steps) {
                 if (!Number.isInteger(amount) || Math.abs(amount) > 100)
                     throw new DeskctlError('InvalidArgs', 'Scroll steps must be integers within ±100');
+            }
+            for (const [amount, positive, negative] of steps) {
                 for (let i = 0; i < Math.abs(amount); i++) {
                     this.pointer.notify_discrete_scroll(now(), amount > 0 ? positive : negative,
                         Clutter.ScrollSource.WHEEL);
-                    await this._sources.sleep(KEY_GAP_MS);
+                    await this._step(KEY_GAP_MS, generation);
                 }
             }
             return this._position();
@@ -140,21 +195,23 @@ export class Input {
         const button = BUTTONS[args.button ?? 'left'];
         if (!button)
             throw new DeskctlError('InvalidArgs', `Button must be one of ${Object.keys(BUTTONS).join(', ')}`);
-        const press = () => this.pointer.notify_button(now(), button, Clutter.ButtonState.PRESSED);
-        const release = () => this.pointer.notify_button(now(), button, Clutter.ButtonState.RELEASED);
         if (action === 'press') {
-            press();
+            this._button(button, true);
         } else if (action === 'release') {
-            release();
+            this._button(button, false);
         } else if (action === 'click') {
             const count = args.count ?? 1;
             if (!Number.isInteger(count) || count < 1 || count > 3)
                 throw new DeskctlError('InvalidArgs', 'Click count must be 1..3');
             for (let i = 0; i < count; i++) {
-                press();
-                await this._sources.sleep(KEY_GAP_MS);
-                release();
-                await this._sources.sleep(KEY_GAP_MS * 3);
+                this._button(button, true);
+                try {
+                    await this._step(KEY_GAP_MS, generation);
+                } finally {
+                    if (generation === this._generation)
+                        this._button(button, false);
+                }
+                await this._step(KEY_GAP_MS * 3, generation);
             }
         } else {
             throw new DeskctlError('InvalidArgs', `Unknown pointer action ${action}`);
@@ -164,10 +221,10 @@ export class Input {
 
     // A new virtual pointer can drop an axis of its first absolute motion,
     // so confirm the pointer arrived and resend if it did not.
-    async _moveTo(x, y) {
+    async _moveTo(x, y, generation) {
         for (let attempt = 0; attempt < 4; attempt++) {
             this.pointer.notify_absolute_motion(now(), x, y);
-            await this._sources.sleep(KEY_GAP_MS);
+            await this._step(KEY_GAP_MS, generation);
             const [px, py] = global.get_pointer();
             if (Math.abs(px - x) <= 1 && Math.abs(py - y) <= 1)
                 return;

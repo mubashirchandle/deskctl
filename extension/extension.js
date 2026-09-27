@@ -160,6 +160,11 @@ class Service {
         this._tracker = Shell.WindowTracker.get_default();
         this._callers = new Map();
         this._paintWatches = new Set();
+        // Switching access off also stops input that is already under way.
+        this._settings.connectObject('changed::enabled', () => {
+            if (!this._settings.get_boolean('enabled'))
+                this._input.abort();
+        }, this);
         // Dynamic workspaces renumber as empty ones vanish; these opaque ids
         // follow the Meta.Workspace object so callers can restore exactly.
         this._workspaceIds = new WeakMap();
@@ -175,6 +180,7 @@ class Service {
     destroy() {
         this._dbus.unexport();
         this._dbus = null;
+        this._settings.disconnectObject(this);
         this._input.destroy();
         this._paintWatches.forEach(id => global.stage.disconnect(id));
         this._paintWatches.clear();
@@ -214,7 +220,7 @@ class Service {
                     throw new DeskctlError('Locked', 'The session is locked');
                 if (!this._settings.get_boolean('enabled')) {
                     throw new DeskctlError('Disabled',
-                        'Agent access is switched off in the top-bar Deskctl menu');
+                        'Agent access is switched off (Agents toggle in Quick Settings)');
                 }
             }
             if (activity)
@@ -286,6 +292,7 @@ class Service {
                 apps: Main.overview.dash.showAppsButton.checked,
             },
             pointer: {x: px, y: py},
+            held_input: this._input.held,
             animations: St.Settings.get().enable_animations,
         };
     }
