@@ -23,6 +23,10 @@ const OBJECT_PATH = '/org/gnome/Shell/Extensions/Deskctl';
 const XML = `<node><interface name="org.gnome.Shell.Extensions.Deskctl1">
   <method name="GetState"><arg direction="out" type="s"/></method>
   <method name="ListWindows"><arg direction="out" type="s"/></method>
+  <method name="AccessibleWindows">
+    <arg direction="in" type="s" name="action"/>
+    <arg direction="out" type="s"/>
+  </method>
   <method name="Screenshot">
     <arg direction="in" type="a{sv}" name="options"/>
     <arg direction="in" type="h" name="fd"/>
@@ -83,6 +87,8 @@ const XML = `<node><interface name="org.gnome.Shell.Extensions.Deskctl1">
 
 const WINDOW_TYPES = Object.fromEntries(
     Object.entries(Meta.WindowType).map(([name, value]) => [value, name.toLowerCase()]));
+// What the CLI reads through AT-SPI; named in the activity list.
+const A11Y_ACTIONS = new Set(['tree', 'find', 'click', 'focus']);
 const MAX_SETTLE_MS = 10000;
 const QUIET_MS = 60;
 const MAX_QUIET_WAIT_MS = 750;
@@ -127,6 +133,10 @@ function unpackOptions(options) {
         ([key, value]) => [key, value instanceof GLib.Variant ? value.recursiveUnpack() : value]));
 }
 
+function rectInfo(rect) {
+    return {x: rect.x, y: rect.y, width: rect.width, height: rect.height};
+}
+
 function windowInfo(window, tracker, focus) {
     const rect = window.get_frame_rect();
     const info = {
@@ -138,7 +148,7 @@ function windowInfo(window, tracker, focus) {
         type: WINDOW_TYPES[window.get_window_type()] ?? 'unknown',
         workspace: window.is_on_all_workspaces() ? 'all' : workspaceNumber(window.get_workspace()),
         monitor: window.get_monitor(),
-        rect: {x: rect.x, y: rect.y, width: rect.width, height: rect.height},
+        rect: rectInfo(rect),
         focused: window === focus,
         minimized: window.minimized,
         maximized: window.is_maximized(),
@@ -356,6 +366,23 @@ class Service {
             const focus = global.display.get_focus_window();
             const windows = global.display.sort_windows_by_stacking(allWindows());
             return windows.map(w => windowInfo(w, this._tracker, focus));
+        });
+    }
+
+    // The CLI walks the apps' accessibility trees itself: AT-SPI calls block
+    // on the app, and a hung app must not freeze the compositor. This call
+    // gates that access, shows it in the activity list, and supplies the
+    // rectangles that turn window-relative extents into stage coordinates.
+    AccessibleWindowsAsync([action], invocation) {
+        return this._run(invocation, `a11y ${action}`, () => {
+            if (!A11Y_ACTIONS.has(action))
+                throw new DeskctlError('InvalidArgs', `Unknown accessibility action ${action}`);
+            const focus = global.display.get_focus_window();
+            return global.display.sort_windows_by_stacking(allWindows()).map(w => ({
+                ...windowInfo(w, this._tracker, focus),
+                client_rect: rectInfo(w.frame_rect_to_client_rect(w.get_frame_rect())),
+                buffer_rect: rectInfo(w.get_buffer_rect()),
+            }));
         });
     }
 

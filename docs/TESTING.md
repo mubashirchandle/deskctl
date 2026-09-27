@@ -21,7 +21,7 @@ tests/smoke.sh
   - only the Quick Settings toggle and the preferences window write the kill switch
   - the extension has no command, eval or file-open surface
 
-`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 39 checks:
+`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 45 checks:
 
 - screenshots at logical and full resolution
 - workspaces and exact restore
@@ -30,8 +30,9 @@ tests/smoke.sh
 - the panel tree
 - the status-area icon, the Quick Settings toggle and all three icon visibility settings
 - pointer accuracy
+- app accessibility trees: reading typed text, clicking buttons by name, named popup menu items, `--action`, dialog scoping
 - keys held through a drag (`--hold super` moves a window; a plain drag doesn't)
-- the kill switch, including interrupting typing and a drag mid-way (which releases held keys too)
+- the kill switch, including refusing `a11y` and interrupting typing and a drag mid-way (which releases held keys too)
 - the shell log
 
 Its last check confirms your real dconf database is byte-for-byte unchanged. That can fail
@@ -64,6 +65,7 @@ deskctl workspace                          # note the active workspace
 deskctl screenshot --workspace 2           # captures workspace 2, returns you to where you were
 deskctl key super; deskctl key Escape      # overview opens, then closes
 deskctl tree panel | head                  # your panel, as text
+deskctl a11y tree | head                   # the focused window's controls, positions matching the screen
 journalctl --user -b _COMM=gnome-shell | grep -i deskctl   # no errors
 ```
 

@@ -1,6 +1,6 @@
 ---
 name: deskctl
-description: See and drive the user's GNOME desktop (GNOME 50 on Wayland) with the `deskctl` CLI — screenshots, workspaces, windows, key/mouse input, GNOME Shell actor trees, dconf diffs, shell logs, and a headless sandbox shell. Use whenever a task changes or inspects the desktop environment (GNOME settings, themes, extensions, keybindings, panel, app appearance) so you can verify your own work visually and textually instead of guessing.
+description: See and drive the user's GNOME desktop (GNOME 50 on Wayland) with the `deskctl` CLI — screenshots, workspaces, windows, key/mouse input, GNOME Shell actor trees, app accessibility trees (find and click controls by name), dconf diffs, shell logs, and a headless sandbox shell. Use whenever a task changes or inspects the desktop environment (GNOME settings, themes, extensions, keybindings, panel, app appearance) so you can verify your own work visually and textually instead of guessing.
 ---
 
 # deskctl — verify desktop work on GNOME
@@ -65,6 +65,7 @@ than full screens.
 | Type | `deskctl type 'text' [--enter]` |
 | Pointer | `deskctl click X Y [--button right] [--double]` · `deskctl move X Y` · `deskctl drag X1 Y1 X2 Y2` · `deskctl scroll --dy 3 [--at X Y]` · add `--hold ctrl` (or `shift`, `ctrl+shift`, …) to `click`, `drag` or `scroll` to keep keys down throughout |
 | Shell UI as text | `deskctl tree panel\|quick-settings\|calendar\|dash\|overview\|message-tray\|ui\|stage [--depth N] [--all] [--json]` |
+| App controls as text | `deskctl a11y tree [WINDOW] [--all] [--json]` · `deskctl a11y find [WINDOW] --name TEXT [--role ROLE] [--regex]` · `deskctl a11y click [WINDOW] --name TEXT [--role ROLE] [--nth N] [--action] [--double] [--hold KEYS]` · `deskctl a11y focus [WINDOW]` (WINDOW: id or `focused`, the default) |
 | Settings diff | `deskctl settings snapshot [NAME]` · `deskctl settings diff [NAME] [--prefix /org/gnome/desktop/]` |
 | Shell logs | `deskctl mark` · `deskctl logs [--since-mark] [--since '5 min ago'] [--all]` |
 | Compare images | `deskctl diff A.png B.png [-o OUT] [--fuzz PCT]` |
@@ -91,8 +92,34 @@ right after them shows the final state.
   keys you meant to change are the only ones that changed.
 - Screenshots default to `~/.cache/deskctl/shots/` (the newest 200 are kept). Pass `-o` for files
   you want to keep or diff.
-- GTK/libadwaita apps are drawn client-side, so `tree` only covers GNOME Shell's own UI (panel,
-  overview, menus, notifications). Use screenshots for app windows.
+- `tree` only covers GNOME Shell's own UI (panel, overview, menus, notifications). For app
+  windows use `a11y` (below).
+
+### Inside app windows: `a11y`
+
+`deskctl a11y` reads a window's accessibility tree (AT-SPI): each control's role, name, stage
+rectangle, states (`focused`, `checked`, `selected`, `expanded`, `disabled`, …), text and value.
+Prefer it to screenshots for finding, clicking and checking controls:
+
+```bash
+deskctl a11y tree                                  # outline of the focused window
+deskctl a11y click --name 'Save' --role button     # clicks the center of the one match
+deskctl a11y find --role 'check box' --name Wrap   # JSON with rect, center, states
+deskctl a11y focus                                 # where keys will go, with its text
+```
+
+- `--name` matches the whole name (or text) ignoring case; `--regex` searches instead. Several
+  matches make `click` fail with a numbered list; narrow with `--role` or pick with `--nth N`.
+- While a dialog is open inside the window, `find` and `click` search only that dialog (it covers
+  the rest); `--anywhere` searches everything.
+- Run `a11y focus` before `key` or `type` when unsure where keyboard focus is: after typing into
+  a field, shortcuts go to that field.
+- Positions inside popup menus and popovers can be off by several pixels (a GTK limitation).
+  Clicking a normal-size item still lands; for small targets there use `click --action`, which
+  runs the control's own action (click, activate, toggle) without the pointer.
+- Password fields show `text="(hidden)"`.
+- Custom-drawn areas (canvases, games, video) and apps without accessibility support have no
+  useful tree; use screenshots there. Qt and Electron apps may need accessibility enabled.
 
 ## Sandbox: a disposable GNOME Shell
 
@@ -119,8 +146,8 @@ deskctl sandbox stop [--purge]
 - Change sandbox settings with `env $(deskctl sandbox env | sed 's/^export //') gsettings set ...`.
 - **Isolation covers the session only.** Apps in the sandbox still use the real *system* bus, so
   toggling Wi-Fi, Bluetooth, power or users in a sandboxed Settings window changes the real machine.
-- The sandbox has no systemd user session, portals or accessibility bus. Flatpak apps and anything
-  needing those won't work there.
+- The sandbox has no systemd user session or portals. Flatpak apps and anything needing those
+  won't work there. It has its own accessibility bus, so `a11y` works for apps started in it.
 
 Use the sandbox for extension code, shell themes and risky settings. Use the live session to
 confirm the final result in the user's real environment.

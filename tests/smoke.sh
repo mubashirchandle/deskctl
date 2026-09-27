@@ -61,6 +61,7 @@ check 'launched window is placed and focused' jq -e '.window.focused and .window
 check 'typing changes the window' jq -e '.changed_pixels > 100 and .bbox != null' \
     <("$D" diff "$tmp/before.png" "$tmp/after.png")
 check 'window title reflects typed text' jq -e 'any(.[]; .title | test("deskctl smoke test"))' <("$D" windows)
+check 'a11y reads the typed text back' jq -e '.text | test("deskctl smoke test")' <("$D" a11y focus)
 
 "$D" key super >/dev/null
 check 'overlay key opens the overview' jq -e '.overview.visible' <("$D" status)
@@ -93,6 +94,17 @@ check 'screenshot on another workspace restores exactly' \
     jq -e '.restored_workspace.exact and .workspace == 2' <(sed -n 2p "$tmp/ws2.txt")
 check 'still on workspace 1' jq -e '.workspace.active == 1' <("$D" status)
 
+check 'a11y tree lists the calculator keys' grep -q '^  button "7" \[' <("$D" a11y tree)
+"$D" a11y click --name 7 --role button >/dev/null
+"$D" a11y click --name 7 --role button >/dev/null
+check 'a11y click lands on the named button' jq -e '.text == "77"' <("$D" a11y focus)
+"$D" a11y click --name 'main menu' --role 'toggle button' >/dev/null
+check 'popup menu items get their label as name' \
+    jq -e 'length == 1' <("$D" a11y find --role 'menu item' --name 'about calculator')
+"$D" a11y click --name 'about calculator' --action >/dev/null
+check 'an open dialog scopes matching' jq -e 'length == 1' <("$D" a11y find --name close)
+"$D" key Escape >/dev/null
+
 check 'eye icon sits in the system status area' \
     grep -qE '^ {12}StIcon .*icon=view-reveal-symbolic' <("$D" tree panel | sed -n '/QuickSettings/,$p')
 "$D" key super+s >/dev/null
@@ -119,6 +131,11 @@ set +e
 status=$?
 set -e
 check 'kill switch refuses calls with exit 4' test "$status" = 4
+set +e
+"$D" a11y tree >/dev/null 2>&1
+status=$?
+set -e
+check 'kill switch refuses a11y with exit 4' test "$status" = 4
 check 'status still works when switched off' jq -e '.enabled == false' <("$D" status)
 kill_switch true
 check 'calls work again after re-enabling' "$D" screenshot -o "$tmp/again.png"

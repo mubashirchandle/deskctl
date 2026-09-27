@@ -206,7 +206,7 @@ class SandboxIsolationTests(unittest.TestCase):
         # The dbus-daemon once inherited the real XDG_CONFIG_HOME, so its
         # activated dconf-service wrote into the user's real settings.
         calls = re.findall(r'subprocess\.Popen\((.*?)\)\n', CLI_SOURCE, re.S)
-        self.assertGreaterEqual(len(calls), 3)
+        self.assertGreaterEqual(len(calls), 5)
         for call in calls:
             self.assertRegex(call, r'\benv=', call[:60])
 
@@ -215,6 +215,69 @@ class SandboxIsolationTests(unittest.TestCase):
             with self.subTest(name=name), self.assertRaises(deskctl.DeskctlError):
                 deskctl.Sandbox(name)
 
+
+
+class AccessibilityTests(unittest.TestCase):
+    WINDOW = {'rect': {'x': 460, 'y': 108, 'width': 360, 'height': 616},
+              'client_rect': {'x': 435, 'y': 83, 'width': 410, 'height': 666},
+              'buffer_rect': {'x': 435, 'y': 83, 'width': 410, 'height': 666}}
+
+    def test_origin_uses_the_rectangle_matching_the_frame(self):
+        # GTK4 counts from the frame; toolkits drawing shadows count from the buffer.
+        self.assertEqual(deskctl.a11y_origin((0, 0, 360, 616), self.WINDOW), (460, 108))
+        self.assertEqual(deskctl.a11y_origin((0, 0, 410, 666), self.WINDOW), (435, 83))
+        self.assertEqual(deskctl.a11y_origin((25, 25, 360, 616), self.WINDOW), (435, 83))
+        self.assertEqual(deskctl.a11y_origin((0, 0, 100, 100), self.WINDOW), (460, 108))
+
+    TREE = {'role': 'frame', 'name': 'App', 'children': [
+        {'role': 'toggle button', 'name': 'Main Menu', 'rect': [10, 10, 30, 30]},
+        {'role': 'button', 'name': 'Close', 'rect': [50, 10, 30, 30]},
+        {'role': 'text', 'name': '', 'text': 'hello', 'rect': [0, 50, 100, 20]},
+        {'role': 'toggle button', 'name': '', 'description': 'Snapping\nToggle snapping (%)'},
+        {'role': 'spin button', 'name': '', 'text': '67.0', 'description': 'Width of selection'},
+        {'role': 'dialog', 'name': 'About', 'children': [
+            {'role': 'button', 'name': 'Close', 'rect': [60, 60, 30, 30]}]},
+    ]}
+
+    def test_matching(self):
+        nodes = list(deskctl.flatten_a11y(self.TREE))
+        names = lambda found: [n['name'] for n in found]  # noqa: E731
+        self.assertEqual(names(deskctl.a11y_matches(nodes, 'main menu')), ['Main Menu'])
+        self.assertEqual(names(deskctl.a11y_matches(nodes, 'Main', regex=True)), ['Main Menu'])
+        self.assertEqual(names(deskctl.a11y_matches(nodes, None, 'Toggle-Button')), ['Main Menu', ''])
+        self.assertEqual(len(deskctl.a11y_matches(nodes, 'close')), 2)
+        self.assertEqual(deskctl.a11y_matches(nodes, 'hello')[0]['role'], 'text')
+        self.assertEqual(deskctl.a11y_matches(nodes, 'mai'), [])
+        self.assertEqual(len(deskctl.a11y_matches(nodes, 'snapping')), 1)
+        self.assertEqual(deskctl.a11y_matches(nodes, 'toggle snapping (%)'), [])
+        self.assertEqual(deskctl.a11y_matches(nodes, 'width of selection')[0]['text'], '67.0')
+        self.assertEqual(deskctl.a11y_matches(nodes, '67.0')[0]['role'], 'spin button')
+
+    def test_open_dialog_scopes_matching(self):
+        scope = deskctl.a11y_scope(self.TREE)
+        self.assertEqual(scope['name'], 'About')
+        found = deskctl.a11y_matches(deskctl.flatten_a11y(scope), 'close')
+        self.assertEqual([n['rect'] for n in found], [[60, 60, 30, 30]])
+        no_dialog = {**self.TREE, 'children': self.TREE['children'][:5]}
+        self.assertIs(deskctl.a11y_scope(no_dialog), no_dialog)
+        chooser = {'role': 'file chooser', 'name': 'Save', 'children': [
+            {'role': 'button', 'name': 'Save'},
+            {'role': 'file chooser', 'name': 'File Chooser Widget', 'children': []}]}
+        self.assertIs(deskctl.a11y_scope(chooser), chooser)
+
+    def test_outline(self):
+        lines = deskctl.render_a11y({'role': 'frame', 'name': 'App', 'rect': [0, 0, 9, 9], 'children': [
+            {'role': 'check box', 'name': 'Wrap', 'rect': [1, 2, 3, 4], 'states': ['checked']},
+            {'role': 'password text', 'name': '', 'text': '(hidden)'}]})
+        self.assertEqual(lines, ['frame "App" [0,0 9x9]',
+                                 '  check box "Wrap" [1,2 3x4] checked',
+                                 '  password text text="(hidden)"'])
+
+    def test_sandbox_apps_get_a_private_accessibility_bus(self):
+        sandbox = deskctl.Sandbox('iso')
+        address = sandbox.base_env()['AT_SPI_BUS_ADDRESS']
+        self.assertEqual(address, f'unix:path={sandbox.runtime / "a11y-bus"}')
+        self.assertEqual(sandbox.client_env()['AT_SPI_BUS_ADDRESS'], address)
 
 class InvariantTests(unittest.TestCase):
     def test_every_dbus_method_has_a_handler(self):

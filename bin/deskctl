@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 
 import gi
 gi.require_version('Gio', '2.0')
@@ -440,6 +441,9 @@ class Sandbox:
         env = {k: v for k, v in os.environ.items() if k in keep or k.startswith('LC_')}
         env.update(self.xdg())
         env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={self.runtime / "bus"}'
+        # Apps find the accessibility bus here instead of asking org.a11y.Bus,
+        # whose launcher would start services through the real systemd session.
+        env['AT_SPI_BUS_ADDRESS'] = f'unix:path={self.runtime / "a11y-bus"}'
         env['XDG_SESSION_TYPE'] = 'wayland'
         env['XDG_CURRENT_DESKTOP'] = 'GNOME'
         env['XDG_SESSION_DESKTOP'] = 'gnome'
@@ -535,6 +539,7 @@ class Sandbox:
         try:
             self._wait(lambda: (self.runtime / 'bus').exists(), 5, 'the sandbox bus')
             self._check_isolation(env)
+            self._start_a11y(env, log, state)
             skipped = []
             if seed:
                 skipped = self._seed(env)
@@ -603,6 +608,26 @@ class Sandbox:
         if skipped:
             result['seed_skipped_locked_keys'] = skipped
         return result
+
+    def _start_a11y(self, env, log, state):
+        """An accessibility bus and registry of its own, started before the
+        shell so every app it launches joins them."""
+        if not (A11Y_BUS_CONFIG.exists() and A11Y_REGISTRYD.exists()):
+            print('deskctl: warning: at-spi2-core not found; `deskctl a11y` will not work in '
+                  'the sandbox', file=sys.stderr)
+            return
+        bus = subprocess.Popen(
+            ['dbus-daemon', f'--config-file={A11Y_BUS_CONFIG}', '--nofork', '--nopidfile',
+             f'--address={env["AT_SPI_BUS_ADDRESS"]}'],
+            env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        state['children'].append(bus.pid)
+        self.state_file.write_text(json.dumps(state, indent=2))
+        self._wait(lambda: (self.runtime / 'a11y-bus').exists(), 5, 'the accessibility bus')
+        registry = subprocess.Popen(
+            [str(A11Y_REGISTRYD)],
+            env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        state['children'].append(registry.pid)
+        self.state_file.write_text(json.dumps(state, indent=2))
 
     def _wait_for_keybindings(self, target, timeout=20):
         """Compositor keybindings only work a few seconds after the shell starts,
@@ -1081,6 +1106,406 @@ def cmd_tree(target, args):
         print('(truncated: node limit reached; narrow the root or depth)')
 
 
+# ---------------------------------------------------------------- accessibility
+
+A11Y_BUS_CONFIG = Path('/usr/share/defaults/at-spi2/accessibility.conf')
+A11Y_REGISTRYD = Path('/usr/libexec/at-spi2-registryd')
+# Unnamed nodes with these roles only lay out their children, so the outline
+# shows the children in their place.
+A11Y_LAYOUT_ROLES = {
+    'panel', 'filler', 'grouping', 'section', 'scroll pane', 'viewport', 'layered pane',
+    'split pane', 'redundant object', 'unknown', 'invalid', 'block quote', 'form',
+}
+A11Y_STATES = ('focused', 'checked', 'indeterminate', 'selected', 'pressed', 'expanded',
+               'collapsed', 'editable', 'modal')
+MAX_A11Y_NODES = 5000
+A11Y_TREE_TEXT = 100
+A11Y_FULL_TEXT = 4000
+_atspi = None
+
+
+def _atspi_for(target):
+    """Load libatspi against the target's accessibility bus, checking it first:
+    libatspi aborts the whole process when it cannot reach the bus."""
+    global _atspi
+    if _atspi:
+        return _atspi
+    if target.sandbox:
+        address = target.env.get('AT_SPI_BUS_ADDRESS', '')
+    else:
+        try:
+            address = target.bus.call_sync(
+                'org.a11y.Bus', '/org/a11y/bus', 'org.a11y.Bus', 'GetAddress', None,
+                GLib.VariantType('(s)'), Gio.DBusCallFlags.NONE, 5000, None).unpack()[0]
+        except GLib.Error as error:
+            raise DeskctlError(f'No accessibility bus on {target.label}: {error.message}',
+                               EXIT_UNAVAILABLE) from None
+    try:
+        bus = Gio.DBusConnection.new_for_address_sync(
+            address, Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+            Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
+        bus.call_sync('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
+                      'StartServiceByName', GLib.Variant('(su)', ('org.a11y.atspi.Registry', 0)),
+                      None, Gio.DBusCallFlags.NONE, 5000, None)
+        bus.close_sync(None)
+    except GLib.Error as error:
+        hint = '; restart the sandbox' if target.sandbox else ''
+        raise DeskctlError(f'The accessibility bus on {target.label} is not usable '
+                           f'({error.message}){hint}', EXIT_UNAVAILABLE) from None
+    os.environ['AT_SPI_BUS_ADDRESS'] = address
+    if target.sandbox:
+        os.environ['DBUS_SESSION_BUS_ADDRESS'] = target.env['DBUS_SESSION_BUS_ADDRESS']
+    try:
+        gi.require_version('Atspi', '2.0')
+        from gi.repository import Atspi
+    except (ValueError, ImportError):
+        raise DeskctlError('AT-SPI bindings are missing; install at-spi2-core', EXIT_UNAVAILABLE) from None
+    Atspi.init()
+    # A hung app then costs seconds, not forever.
+    Atspi.set_timeout(3000, 15000)
+    _atspi = Atspi
+    return Atspi
+
+
+def _children(node):
+    try:
+        return [child for child in (node.get_child_at_index(i) for i in range(node.get_child_count()))
+                if child is not None]
+    except GLib.Error:
+        return []
+
+
+def _extents(Atspi, node):
+    try:
+        component = node.get_component_iface()
+        if component:
+            box = component.get_extents(Atspi.CoordType.WINDOW)
+            return box.x, box.y, box.width, box.height
+    except GLib.Error:
+        pass
+    return None
+
+
+def _truncate(text, limit):
+    return text if len(text) <= limit else text[:limit] + '…'
+
+
+A11Y_WINDOW_RECTS = ('rect', 'client_rect', 'buffer_rect')
+
+
+def _same_size(box, rect):
+    return abs(box[2] - rect['width']) <= 2 and abs(box[3] - rect['height']) <= 2
+
+
+def a11y_origin(box, window):
+    """Stage position of a window's (0, 0) for AT-SPI window-relative extents.
+    Toolkits count from different surfaces (GTK4: the frame, X11: the client
+    area, others: the buffer with its shadows), so use the rectangle whose
+    size matches the top-level accessible's extents BOX."""
+    rect = next((window[key] for key in A11Y_WINDOW_RECTS if _same_size(box, window[key])),
+                window['rect'])
+    return rect['x'] - box[0], rect['y'] - box[1]
+
+
+class A11yWindow:
+    """One window's accessibility tree, with extents mapped to stage coordinates."""
+
+    def __init__(self, Atspi, window):
+        self.Atspi = Atspi
+        self.window = window
+        self.frame = self._match_frame()
+        if self.frame is None:
+            raise DeskctlError(f'Window {window["id"]} ({window["title"]!r}) has no accessibility '
+                               'tree; its app may not support AT-SPI', EXIT_NOT_FOUND)
+        self.origin = a11y_origin(_extents(Atspi, self.frame) or (0, 0, 0, 0), window)
+
+    def _match_frame(self):
+        """The app's top-level accessible for this window: same process, then
+        the best title, size and focus match."""
+        window = self.window
+        apps = _children(self.Atspi.get_desktop(0))
+        own = [app for app in apps if self._safe(app.get_process_id) == window['pid']]
+        best, best_score = None, 0
+        for app in own or apps:
+            for frame in _children(app):
+                score = 0
+                if self._safe(frame.get_name) == window['title']:
+                    score += 2
+                box = _extents(self.Atspi, frame)
+                if box and any(_same_size(box, window[key]) for key in A11Y_WINDOW_RECTS):
+                    score += 1
+                if window['focused'] and self._states(frame) & {'active'}:
+                    score += 1
+                if own and score == 0 and len(_children(app)) == 1:
+                    score = 1
+                if score > best_score and (own or score >= 3):
+                    best, best_score = frame, score
+        return best
+
+    @staticmethod
+    def _safe(getter, default=None):
+        try:
+            return getter()
+        except GLib.Error:
+            return default
+
+    def _states(self, node):
+        states = self._safe(node.get_state_set)
+        return {s.value_nick for s in states.get_states()} if states else set()
+
+    def _label(self, node):
+        """The text of the labels naming an unnamed node (GTK4 menu items)."""
+        Atspi = self.Atspi
+        names = []
+        try:
+            for relation in node.get_relation_set():
+                if relation.get_relation_type() != Atspi.RelationType.LABELLED_BY:
+                    continue
+                for i in range(relation.get_n_targets()):
+                    label = relation.get_target(i)
+                    text = label.get_name() or (Atspi.Text.get_text(
+                        label, 0, Atspi.Text.get_character_count(label)) if label.get_text_iface() else '')
+                    if text.strip():
+                        names.append(text.strip())
+        except GLib.Error:
+            pass
+        return ' '.join(names)
+
+    def describe(self, node, text_limit):
+        """Role, name, stage rect, notable states, and text or value."""
+        Atspi = self.Atspi
+        role = self._safe(node.get_role_name, 'unknown')
+        info = {'role': role, 'name': (self._safe(node.get_name) or '').strip() or self._label(node)}
+        box = _extents(Atspi, node)
+        if box and box[2] > 0 and box[3] > 0:
+            info['rect'] = [box[0] + self.origin[0], box[1] + self.origin[1], box[2], box[3]]
+        states = self._states(node)
+        info['states'] = [s for s in A11Y_STATES if s in states]
+        if 'expandable' not in states:
+            info['states'] = [s for s in info['states'] if s not in ('expanded', 'collapsed')]
+        if 'sensitive' not in states and 'enabled' not in states:
+            info['states'].append('disabled')
+        description = (self._safe(node.get_description) or '').strip()
+        if description and description != info['name']:
+            info['description'] = description
+        if role == 'password text':
+            info['text'] = '(hidden)'
+        else:
+            try:
+                if node.get_text_iface():
+                    count = Atspi.Text.get_character_count(node)
+                    text = Atspi.Text.get_text(node, 0, min(count, text_limit + 1))
+                    if text and text.strip() != info['name']:
+                        info['text'] = _truncate(text, text_limit)
+                if node.get_value_iface():
+                    info['value'] = Atspi.Value.get_current_value(node)
+            except GLib.Error:
+                pass
+        info['_states'] = states
+        info['_node'] = node
+        return info
+
+    def walk(self, include_hidden=False, text_limit=A11Y_TREE_TEXT):
+        """The outline: hidden subtrees dropped, layout-only containers
+        replaced by their children, labels repeating their parent skipped."""
+        self.visited = 0
+        self.truncated = False
+        self.nodes = {}  # id(info) -> accessible, for acting on a match
+        return self._walk(self.frame, include_hidden, text_limit, None)[0]
+
+    def _walk(self, node, include_hidden, text_limit, parent_name):
+        if self.visited >= MAX_A11Y_NODES:
+            self.truncated = True
+            return []
+        self.visited += 1
+        info = self.describe(node, text_limit)
+        if not include_hidden and 'showing' not in info['_states'] and node is not self.frame:
+            return []
+        children = []
+        for child in _children(node):
+            children += self._walk(child, include_hidden, text_limit, info['name'] or parent_name)
+        info.pop('_states')
+        self.nodes[id(info)] = info.pop('_node')
+        if not info['states']:
+            del info['states']
+        plain = not info['name'] and 'text' not in info and 'value' not in info
+        if node is not self.frame and not include_hidden:
+            if plain and info['role'] in A11Y_LAYOUT_ROLES:
+                return children
+            if (info['role'] == 'label' and not children and info['name'] == parent_name
+                    and 'text' not in info):
+                return []
+        if children:
+            info['children'] = children
+        return [info]
+
+
+def flatten_a11y(node):
+    yield node
+    for child in node.get('children', []):
+        yield from flatten_a11y(child)
+
+
+# Roles of in-window overlays. Not 'file chooser': that is also an embedded widget.
+A11Y_DIALOG_ROLES = {'dialog', 'alert'}
+
+
+def a11y_scope(root):
+    """The last dialog inside the window (an in-window sheet or popover covers
+    everything else), or the whole window."""
+    dialogs = [n for n in flatten_a11y(root) if n['role'] in A11Y_DIALOG_ROLES and n is not root]
+    return dialogs[-1] if dialogs else root
+
+
+def a11y_matches(nodes, name=None, role=None, regex=False):
+    """Nodes whose name (exact, ignoring case; or a regex search) and role match.
+    Unnamed nodes match on their text or their description's first line."""
+    def norm(text):
+        return ' '.join(text.replace('-', ' ').replace('_', ' ').split()).casefold()
+    pattern = re.compile(name, re.I) if name is not None and regex else None
+    found = []
+    for node in nodes:
+        if role is not None and norm(node['role']) != norm(role):
+            continue
+        if name is not None:
+            # Icon-only buttons and bare fields are known by their tooltip's first line.
+            labels = [node['name']] if node['name'] else [
+                node.get('text', ''), node.get('description', '').split('\n')[0]]
+            if pattern:
+                if not any(pattern.search(label) for label in labels):
+                    continue
+            elif norm(name) not in map(norm, labels):
+                continue
+        found.append(node)
+    return found
+
+
+def render_a11y(node, depth=0, lines=None):
+    lines = [] if lines is None else lines
+    parts = [node['role']]
+    if node['name']:
+        parts.append(json.dumps(node['name'], ensure_ascii=False))
+    if node.get('rect'):
+        x, y, w, h = node['rect']
+        parts.append(f'[{x},{y} {w}x{h}]')
+    parts += node.get('states', [])
+    if 'text' in node:
+        parts.append('text=' + json.dumps(node['text'], ensure_ascii=False))
+    if 'value' in node:
+        parts.append(f"value={node['value']:g}")
+    if node.get('description'):
+        parts.append('desc=' + json.dumps(node['description'], ensure_ascii=False))
+    lines.append('  ' * depth + ' '.join(parts))
+    for child in node.get('children', []):
+        render_a11y(child, depth + 1, lines)
+    return lines
+
+
+def _a11y_window(target, args, action):
+    windows = target.call('AccessibleWindows', '(s)', (action,))
+    if args.window == 'focused':
+        window = next((w for w in windows if w['focused']), None)
+        if not window:
+            raise DeskctlError('No window has focus', EXIT_NOT_FOUND)
+    else:
+        window = next((w for w in windows if str(w['id']) == args.window), None)
+        if not window:
+            raise DeskctlError(f'No window with id {args.window}', EXIT_NOT_FOUND)
+    return A11yWindow(_atspi_for(target), window)
+
+
+def _center(node):
+    x, y, w, h = node['rect']
+    return round(x + w / 2), round(y + h / 2)
+
+
+def _found(nodes):
+    return [{**{k: v for k, v in n.items() if k != 'children'},
+             **({'center': list(_center(n))} if n.get('rect') else {})} for n in nodes]
+
+
+def _do_action(tree, node):
+    """Run the node's first AT-SPI action (click, activate, press, toggle...)."""
+    Atspi, accessible = tree.Atspi, tree.nodes[id(node)]
+    try:
+        count = Atspi.Action.get_n_actions(accessible) if accessible.get_action_iface() else 0
+        if not count:
+            raise DeskctlError(f'{node["role"]} {node["name"]!r} has no action; click it instead',
+                               EXIT_FAILED)
+        with warnings.catch_warnings():
+            # PyGObject flags the only name getter the typelib offers.
+            warnings.simplefilter('ignore', DeprecationWarning)
+            name = Atspi.Action.get_action_name(accessible, 0)
+        if not Atspi.Action.do_action(accessible, 0):
+            raise DeskctlError(f'{node["role"]} {node["name"]!r} refused its {name!r} action')
+    except GLib.Error as error:
+        raise DeskctlError(f'Action failed: {error.message}') from None
+    return {'action': name, 'role': node['role'], 'name': node['name']}
+
+
+def cmd_a11y(target, args):
+    action = args.a11y_action
+    tree = _a11y_window(target, args, action)
+    if action == 'tree':
+        root = tree.walk(include_hidden=args.all)
+        if args.json:
+            emit({'window': tree.window['id'], 'tree': root, 'truncated': tree.truncated})
+            return
+        print('\n'.join(render_a11y(root)))
+        if tree.truncated:
+            print(f'(truncated after {MAX_A11Y_NODES} nodes)')
+        return
+    if action == 'focus':
+        node = next((n for n in flatten_a11y(tree.walk(text_limit=A11Y_FULL_TEXT))
+                     if 'focused' in n.get('states', [])), None)
+        if not node:
+            raise DeskctlError('Nothing in the window has keyboard focus', EXIT_NOT_FOUND)
+        emit(_found([node])[0])
+        return
+    if args.name is None and args.role is None:
+        raise DeskctlError('Give --name, --role or both', EXIT_USAGE)
+    root = tree.walk(text_limit=A11Y_FULL_TEXT)
+    nodes = a11y_matches(flatten_a11y(root if args.anywhere else a11y_scope(root)),
+                         args.name, args.role, args.regex)
+    if action == 'find':
+        emit_list(_found(nodes))
+        return
+    # click
+    if args.action and (args.double or args.hold or args.button != 'left'):
+        raise DeskctlError('--action performs the control\'s own action; it takes no '
+                           '--double, --hold or --button', EXIT_USAGE)
+    clickable = nodes if args.action else [n for n in nodes if n.get('rect')]
+    if args.nth is not None:
+        if not 1 <= args.nth <= len(clickable):
+            raise DeskctlError(f'--nth {args.nth} but {len(clickable)} match', EXIT_NOT_FOUND)
+        clickable = [clickable[args.nth - 1]]
+    if not clickable:
+        raise DeskctlError('No visible match; check `deskctl a11y find`', EXIT_NOT_FOUND)
+    if len(clickable) > 1:
+        listing = '\n'.join(f'  {i}: {n["role"]} {n["name"]!r} {n["rect"]}'
+                            for i, n in enumerate(clickable[:10], 1))
+        raise DeskctlError(f'{len(clickable)} matches; narrow with --role or pick with --nth:\n'
+                           + listing, EXIT_USAGE)
+    node = clickable[0]
+    if args.action:
+        emit(_do_action(tree, node))
+        if not args.no_settle:
+            target.settle()
+        return
+    x, y = _center(node)
+    frame = tree.window['rect']
+    if not (frame['x'] <= x < frame['x'] + frame['width'] and
+            frame['y'] <= y < frame['y'] + frame['height']):
+        raise DeskctlError(f'{node["role"]} {node["name"]!r} is outside its window '
+                           '(scrolled out of view?)', EXIT_FAILED)
+    if not tree.window['focused']:
+        target.call('WindowAction', '(tsa{sv})', (tree.window['id'], 'focus', {}))
+        target.settle()
+    _pointer(target, 'click', {'x': x, 'y': y, 'button': args.button,
+                               'count': 2 if args.double else 1,
+                               'hold': parse_hold(args.hold)}, not args.no_settle)
+
+
 def cmd_diff(target, args):
     a, b = Path(args.a), Path(args.b)
     for path in (a, b):
@@ -1318,6 +1743,33 @@ def build_parser():
     p.add_argument('--all', action='store_true', help='descend into hidden actors')
     p.add_argument('--json', action='store_true')
 
+    p = sub.add_parser('a11y', help="read and click controls inside app windows through AT-SPI")
+    actions = p.add_subparsers(dest='a11y_action', required=True, metavar='ACTION')
+    win = argparse.ArgumentParser(add_help=False)
+    win.add_argument('window', nargs='?', default='focused', metavar='WINDOW',
+                     help='window id from `deskctl windows`, or "focused" (default)')
+    match = argparse.ArgumentParser(add_help=False)
+    match.add_argument('--name', help='accessible name (or text) to match, ignoring case')
+    match.add_argument('--role', help='role to match, e.g. button, "toggle button", text, menu item')
+    match.add_argument('--regex', action='store_true', help='treat --name as a regex to search for')
+    match.add_argument('--anywhere', action='store_true',
+                       help='also match behind an open dialog (by default only the topmost '
+                            'dialog in the window is searched)')
+    q = actions.add_parser('tree', parents=[win], help="the window's controls as an outline")
+    q.add_argument('--all', action='store_true', help='include hidden nodes and layout containers')
+    q.add_argument('--json', action='store_true')
+    actions.add_parser('find', parents=[win, match], help='controls matching --name/--role, with centers')
+    q = actions.add_parser('click', parents=[win, match, settle],
+                           help='click the one matching control at its center')
+    q.add_argument('--nth', type=positive_int, help='pick the Nth of several matches')
+    q.add_argument('--action', action='store_true',
+                   help="run the control's own action (click/activate) instead of clicking its "
+                        'center; for menus and controls without reliable positions')
+    q.add_argument('--button', choices=['left', 'middle', 'right'], default='left')
+    q.add_argument('--double', action='store_true')
+    q.add_argument('--hold', metavar='KEYS', help='keys held while clicking, e.g. ctrl')
+    actions.add_parser('focus', parents=[win], help='the control that has keyboard focus, with its text')
+
     p = sub.add_parser('diff', help='compare two screenshots of the same size')
     p.add_argument('a')
     p.add_argument('b')
@@ -1374,7 +1826,7 @@ COMMANDS = {
     'overview': cmd_overview, 'launch': cmd_launch, 'wait-window': cmd_wait_window,
     'key': cmd_key, 'type': cmd_type, 'click': cmd_click, 'move': cmd_move,
     'drag': cmd_drag, 'scroll': cmd_scroll, 'tree': cmd_tree, 'diff': cmd_diff,
-    'settings': cmd_settings, 'mark': cmd_mark, 'logs': cmd_logs,
+    'settings': cmd_settings, 'mark': cmd_mark, 'logs': cmd_logs, 'a11y': cmd_a11y,
 }
 
 

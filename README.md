@@ -9,6 +9,7 @@ deskctl status                              # monitors, workspaces, focus, theme
 deskctl screenshot --window focused         # prints the PNG path, then JSON metadata
 deskctl workspace 2                         # switch; waits for the animation to finish
 deskctl key super+s && deskctl tree quick-settings   # open Quick Settings, read it as text
+deskctl a11y click --name Save --role button # find a control in an app window and click it
 deskctl settings snapshot && ... && deskctl settings diff
 deskctl sandbox start --seed                # a disposable headless copy of your desktop
 ```
@@ -78,6 +79,10 @@ Switching off also stops input already under way: typing or a drag halts at its 
 keystroke or pointer step, every key and mouse button the agent holds is released, and the
 interrupted command exits with status 4 saying how far it got (for example "stopped after 43 of
 200 characters"). Captures and window actions take milliseconds, so they simply finish.
+
+`deskctl a11y` reads app accessibility trees in the CLI process rather than in GNOME Shell (an app
+that stops answering must not freeze the compositor), but each command starts with a gated call,
+so it is refused while access is off and shows in the activity list.
 
 No D-Bus method can turn access back on. Only the toggle can, or the preferences window
 (`gnome-extensions prefs deskctl@local`).
@@ -149,8 +154,10 @@ its environment.
 
 The sandbox isolates the session only. Apps inside it still use the real system bus, so
 NetworkManager, Bluetooth, power and accounts changes affect the machine. There is no systemd
-user session, portal or accessibility bus inside, so Flatpak apps and portal-dependent features
-won't work there.
+user session or portal inside, so Flatpak apps and portal-dependent features won't work there.
+The sandbox runs its own accessibility bus and registry (not `at-spi-bus-launcher`, which would
+start services through your real systemd session) and points its apps at it with
+`AT_SPI_BUS_ADDRESS`.
 
 ## How it works
 
@@ -165,6 +172,7 @@ string.
 | Input | Clutter virtual keyboard and pointer, so compositor keybindings fire exactly as for hardware |
 | Settling | Polls the overview, workspace-switch and window-manager animation state, then waits for a short stretch with no stage repaints |
 | Indicator | A Quick Settings `SystemIndicator` (status-area icon) with an `Agents` `QuickMenuToggle`, like the built-in toggles |
+| App controls | The CLI walks AT-SPI trees with libatspi and maps window-relative extents to the stage using the window rectangles the extension reports |
 
 The CLI adds downscaling, grids, diffs (`magick compare`), dconf snapshots, journal filtering and
 sandbox management.
