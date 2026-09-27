@@ -135,6 +135,19 @@ def parse_combo(combo):
     return [parse_key(token) for token in tokens]
 
 
+def accel_to_combo(accel):
+    """'<Super>s' -> ['Super_L', 's']; None for anything unusual."""
+    modifiers = {'super': 'Super_L', 'control': 'Control_L', 'primary': 'Control_L',
+                 'ctrl': 'Control_L', 'alt': 'Alt_L', 'shift': 'Shift_L'}
+    match = re.fullmatch(r'((?:<\w+>)*)(\w+)', accel or '')
+    if not match:
+        return None
+    names = re.findall(r'<(\w+)>', match.group(1))
+    if any(name.lower() not in modifiers for name in names):
+        return None
+    return [modifiers[name.lower()] for name in names] + [match.group(2)]
+
+
 def parse_rect(text):
     match = re.fullmatch(r'\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*', text)
     if not match:
@@ -570,15 +583,49 @@ class Sandbox:
         info = target.extensions()
         if info.get(UUID, {}).get('state') != 'ACTIVE':
             raise DeskctlError(f'{UUID} is not active in the sandbox: {info.get(UUID)}')
-        if not keep_overview:
-            target.call('Overview', '(s)', ('hide',))
+        keyboard_ready = self._wait_for_keybindings(target)
+        if not keyboard_ready:
+            print('deskctl: warning: compositor keybindings did not respond within 20s',
+                  file=sys.stderr)
+        # A fresh shell's pointer sits at 0,0 inside the hot corner, so the first
+        # pointer action would open the overview. Park it mid-stage now.
+        stage = target.state()['stage']
+        target.call('Pointer', '(sa{sv})', ('move', {
+            'x': GLib.Variant('d', stage['width'] // 2), 'y': GLib.Variant('d', stage['height'] // 2)}))
+        target.call('Overview', '(s)', ('hide',))
+        target.settle()
+        if keep_overview:
+            target.call('Overview', '(s)', ('show',))
             target.settle()
         result = {'sandbox': self.name, 'size': size, 'scale': scale or 1,
                   'display': self.display, 'address': state['address'], 'log': str(self.log),
-                  'extensions': info, 'state': target.state()}
+                  'keyboard_ready': keyboard_ready, 'extensions': info, 'state': target.state()}
         if skipped:
             result['seed_skipped_locked_keys'] = skipped
         return result
+
+    def _wait_for_keybindings(self, target, timeout=20):
+        """Compositor keybindings only work a few seconds after the shell starts,
+        so press the Quick Settings shortcut until its menu actually opens."""
+        accel = target.run(['gsettings', 'get', 'org.gnome.shell.keybindings',
+                            'toggle-quick-settings'], capture_output=True, text=True).stdout
+        combo = accel_to_combo(next(iter(re.findall(r"'([^']+)'", accel)), ''))
+        if not combo:
+            time.sleep(5)  # No usable shortcut to probe with; allow the usual delay.
+            return False
+        target.call('Overview', '(s)', ('hide',))
+        target.settle()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            target.call('Keys', '(aas)', ([combo],))
+            target.settle()
+            menu = target.call('ShellTree', '(sub)', ('quick-settings', 0, False))['tree']
+            if menu.get('visible', True):
+                target.call('Keys', '(aas)', ([['Escape']],))
+                target.settle()
+                return True
+            time.sleep(0.5)
+        return False
 
     def _seed(self, env):
         """Copy the real dconf database in, minus keys system policy has locked."""
