@@ -1,0 +1,1307 @@
+#!/usr/bin/python3
+"""Let AI agents see and drive the GNOME desktop through the deskctl@local extension.
+
+Talks to the extension's D-Bus API on the live session bus, or on the private
+bus of a headless sandbox shell started by `deskctl sandbox start`.
+"""
+import argparse
+import configparser
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+import gi
+gi.require_version('Gio', '2.0')
+from gi.repository import Gio, GLib  # noqa: E402
+
+BUS_NAME = 'org.gnome.Shell'
+OBJECT_PATH = '/org/gnome/Shell/Extensions/Deskctl'
+INTERFACE = 'org.gnome.Shell.Extensions.Deskctl1'
+ERROR_PREFIX = 'org.gnome.Shell.Extensions.Deskctl.Error.'
+UUID = 'deskctl@local'
+PROJECT_DIR = Path(__file__).resolve().parent.parent
+EXTENSION_DIR = PROJECT_DIR / 'extension'
+
+# Sandbox environments override XDG_CACHE_HOME, so they carry this anchor to
+# keep deskctl's own state (sandboxes, shots, snapshots) in one place.
+CACHE_DIR = Path(os.environ.get('DESKCTL_CACHE_DIR') or Path(GLib.get_user_cache_dir()) / 'deskctl')
+SHOTS_DIR = CACHE_DIR / 'shots'
+SANDBOX_DIR = CACHE_DIR / 'sandbox'
+KEEP_SHOTS = 200
+
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_UNAVAILABLE = 3
+EXIT_DISABLED = 4
+EXIT_LOCKED = 5
+EXIT_NOT_FOUND = 6
+EXIT_TIMEOUT = 7
+REMOTE_EXIT = {
+    'InvalidArgs': EXIT_USAGE,
+    'Disabled': EXIT_DISABLED,
+    'Locked': EXIT_LOCKED,
+    'NotFound': EXIT_NOT_FOUND,
+    'Timeout': EXIT_TIMEOUT,
+}
+UNAVAILABLE_ERRORS = {
+    'org.freedesktop.DBus.Error.ServiceUnknown',
+    'org.freedesktop.DBus.Error.UnknownMethod',
+    'org.freedesktop.DBus.Error.UnknownObject',
+    'org.freedesktop.DBus.Error.UnknownInterface',
+    'org.freedesktop.DBus.Error.NameHasNoOwner',
+}
+EXTENSION_STATES = {
+    1: 'ACTIVE', 2: 'INACTIVE', 3: 'ERROR', 4: 'OUT_OF_DATE', 5: 'DOWNLOADING',
+    6: 'INITIALIZED', 7: 'DEACTIVATING', 8: 'ACTIVATING', 99: 'UNINSTALLED',
+}
+STATUS_SETTINGS = {
+    'org.gnome.desktop.interface': [
+        'color-scheme', 'accent-color', 'gtk-theme', 'icon-theme', 'cursor-theme',
+        'cursor-size', 'font-name', 'document-font-name', 'monospace-font-name',
+        'text-scaling-factor', 'enable-animations', 'clock-format',
+    ],
+    'org.gnome.desktop.wm.preferences': ['button-layout', 'num-workspaces', 'focus-mode'],
+    'org.gnome.mutter': ['dynamic-workspaces', 'workspaces-only-on-primary', 'edge-tiling'],
+    'org.gnome.shell': ['favorite-apps'],
+}
+# Window types agents usually care about; --all lists the rest too.
+USER_WINDOW_TYPES = {'normal', 'dialog', 'modal_dialog', 'utility'}
+
+MODIFIERS = {
+    'super': 'Super_L', 'win': 'Super_L', 'meta': 'Super_L', 'logo': 'Super_L',
+    'ctrl': 'Control_L', 'control': 'Control_L',
+    'alt': 'Alt_L', 'shift': 'Shift_L', 'altgr': 'ISO_Level3_Shift',
+}
+KEY_ALIASES = {
+    'enter': 'Return', 'return': 'Return', 'esc': 'Escape', 'escape': 'Escape',
+    'space': 'space', 'tab': 'Tab', 'backspace': 'BackSpace', 'delete': 'Delete',
+    'del': 'Delete', 'insert': 'Insert', 'ins': 'Insert', 'home': 'Home', 'end': 'End',
+    'pageup': 'Page_Up', 'pgup': 'Page_Up', 'pagedown': 'Page_Down', 'pgdn': 'Page_Down',
+    'up': 'Up', 'down': 'Down', 'left': 'Left', 'right': 'Right',
+    'print': 'Print', 'menu': 'Menu', 'capslock': 'Caps_Lock', 'plus': 'plus',
+}
+PUNCTUATION = {
+    '-': 'minus', '=': 'equal', ',': 'comma', '.': 'period', '/': 'slash',
+    ';': 'semicolon', "'": 'apostrophe', '[': 'bracketleft', ']': 'bracketright',
+    '\\': 'backslash', '`': 'grave',
+}
+
+
+class DeskctlError(Exception):
+    def __init__(self, message, status=EXIT_FAILED):
+        super().__init__(message)
+        self.status = status
+
+
+# ---------------------------------------------------------------- parsing
+
+def parse_key(token):
+    lower = token.lower()
+    if lower in MODIFIERS:
+        return MODIFIERS[lower]
+    if lower in KEY_ALIASES:
+        return KEY_ALIASES[lower]
+    if re.fullmatch(r'f([1-9]|[12][0-9]|3[0-5])', lower):
+        return lower.upper()
+    if len(token) == 1:
+        if token.isalnum() and token.isascii():
+            return lower
+        if token in PUNCTUATION:
+            return PUNCTUATION[token]
+    if re.fullmatch(r'[A-Za-z0-9_]{2,}', token):
+        return token  # A raw X keysym name such as XF86AudioMute or Super_R.
+    raise DeskctlError(f'Unknown key {token!r}', EXIT_USAGE)
+
+
+def parse_combo(combo):
+    """'ctrl+alt+t' -> ['Control_L', 'Alt_L', 't']; 'ctrl++' presses plus."""
+    if combo == '+':
+        return ['plus']
+    if combo.endswith('++'):
+        tokens = combo[:-2].split('+') + ['plus']
+    else:
+        tokens = combo.split('+')
+    if not combo or any(token == '' for token in tokens):
+        raise DeskctlError(f'Malformed key combo {combo!r}', EXIT_USAGE)
+    return [parse_key(token) for token in tokens]
+
+
+def parse_rect(text):
+    match = re.fullmatch(r'\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*', text)
+    if not match:
+        raise argparse.ArgumentTypeError('expected X,Y,WIDTH,HEIGHT in logical pixels')
+    x, y, width, height = map(int, match.groups())
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError('width and height must be positive')
+    return {'x': x, 'y': y, 'width': width, 'height': height}
+
+
+def parse_window_id(text):
+    if text == 'focused':
+        return text
+    if not text.isdigit():
+        raise argparse.ArgumentTypeError('window id must be a number from `deskctl windows` or "focused"')
+    return int(text)
+
+
+def positive_int(text):
+    value = int(text)
+    if value <= 0:
+        raise argparse.ArgumentTypeError('must be positive')
+    return value
+
+
+def grid_lines(origin, length, step):
+    """Logical coordinates of grid lines that fall inside [origin, origin+length)."""
+    first = math.ceil(origin / step) * step
+    return list(range(first, origin + length, step))
+
+
+def parse_dconf_dump(text):
+    """Flatten `dconf dump` output into {'/path/key': 'gvariant text'}."""
+    parser = configparser.ConfigParser(interpolation=None, delimiters=('=',),
+                                       comment_prefixes=(), strict=False)
+    parser.optionxform = str
+    parser.read_string(text)
+    flat = {}
+    for section in parser.sections():
+        base = '/' + section.strip('/') + '/' if section != '/' else '/'
+        for key, value in parser.items(section, raw=True):
+            flat[base + key] = value
+    return flat
+
+
+def diff_settings(old, new):
+    changed = {k: {'old': old[k], 'new': new[k]} for k in sorted(old.keys() & new.keys())
+               if old[k] != new[k]}
+    added = {k: new[k] for k in sorted(new.keys() - old.keys())}
+    removed = {k: old[k] for k in sorted(old.keys() - new.keys())}
+    return {'changed': changed, 'added': added, 'removed': removed}
+
+
+# ---------------------------------------------------------------- output
+
+def emit(value):
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def emit_list(items):
+    # One compact object per line keeps long lists cheap to read.
+    if not items:
+        print('[]')
+        return
+    print('[')
+    print(',\n'.join(json.dumps(item, ensure_ascii=False, separators=(',', ':')) for item in items))
+    print(']')
+
+
+def render_tree(node, depth=0, lines=None):
+    lines = [] if lines is None else lines
+    parts = [node['type'] + (f"#{node['name']}" if node.get('name') else '')]
+    if node.get('style_class'):
+        parts.append('.' + '.'.join(node['style_class'].split()))
+    if node.get('pseudo_class'):
+        parts.append(':' + ':'.join(node['pseudo_class'].split()))
+    if node.get('text'):
+        parts.append(json.dumps(node['text'], ensure_ascii=False))
+    if node.get('accessible_name') and node.get('accessible_name') != node.get('text'):
+        parts.append(f"a11y={json.dumps(node['accessible_name'], ensure_ascii=False)}")
+    if node.get('icon'):
+        parts.append(f"icon={node['icon']}")
+    if node.get('rect'):
+        x, y, w, h = node['rect']
+        parts.append(f'[{x},{y} {w}x{h}]')
+    if node.get('visible') is False:
+        parts.append('HIDDEN')
+    elif node.get('mapped') is False:
+        parts.append('unmapped')
+    if node.get('reactive'):
+        parts.append('reactive')
+    if node.get('children_omitted'):
+        parts.append(f"(+{node['children_omitted']} children)")
+    lines.append('  ' * depth + ' '.join(parts))
+    for child in node.get('children', []):
+        render_tree(child, depth + 1, lines)
+    return lines
+
+
+# ---------------------------------------------------------------- targets
+
+class Target:
+    """The live session, or a sandbox shell on its own private bus."""
+
+    def __init__(self, sandbox=None):
+        self.sandbox = sandbox
+        if sandbox is None:
+            self.label = 'live'
+            self.env = dict(os.environ)
+            try:
+                self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            except GLib.Error as error:
+                raise DeskctlError(f'Session bus unavailable: {error.message}',
+                                   EXIT_UNAVAILABLE) from None
+        else:
+            self.label = f'sandbox:{sandbox.name}'
+            state = sandbox.state()
+            if not sandbox.running(state):
+                raise DeskctlError(f'Sandbox {sandbox.name!r} is not running; '
+                                   f'start it with: deskctl sandbox start --name {sandbox.name}',
+                                   EXIT_UNAVAILABLE)
+            self.env = sandbox.client_env(state)
+            try:
+                self.bus = Gio.DBusConnection.new_for_address_sync(
+                    state['address'],
+                    Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT |
+                    Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION,
+                    None, None)
+            except GLib.Error as error:
+                raise DeskctlError(f'Sandbox bus unavailable: {error.message}',
+                                   EXIT_UNAVAILABLE) from None
+
+    def call(self, method, signature=None, args=None, fds=None, timeout=25000):
+        params = GLib.Variant(signature, args) if signature else None
+        try:
+            if fds:
+                fd_list = Gio.UnixFDList()
+                for fd in fds:
+                    fd_list.append(fd)
+                result, _ = self.bus.call_with_unix_fd_list_sync(
+                    BUS_NAME, OBJECT_PATH, INTERFACE, method, params, GLib.VariantType('(s)'),
+                    Gio.DBusCallFlags.NONE, timeout, fd_list, None)
+            else:
+                result = self.bus.call_sync(
+                    BUS_NAME, OBJECT_PATH, INTERFACE, method, params, GLib.VariantType('(s)'),
+                    Gio.DBusCallFlags.NONE, timeout, None)
+        except GLib.Error as error:
+            raise self._translate(error) from None
+        return json.loads(result.unpack()[0])
+
+    def _translate(self, error):
+        remote = Gio.DBusError.get_remote_error(error) or ''
+        # PyGObject hands us a copy, so strip_remote_error() cannot edit it.
+        message = re.sub(r'^GDBus\.Error:[\w.]+:\s*', '', error.message)
+        if remote.startswith(ERROR_PREFIX):
+            code = remote[len(ERROR_PREFIX):]
+            return DeskctlError(message, REMOTE_EXIT.get(code, EXIT_FAILED))
+        if remote in UNAVAILABLE_ERRORS:
+            hint = ('start it with `deskctl sandbox start`' if self.sandbox else
+                    'install it, log out and back in, then `gnome-extensions enable deskctl@local`')
+            return DeskctlError(f'The {UUID} extension is not active on {self.label} ({message}); '
+                                f'{hint}', EXIT_UNAVAILABLE)
+        if error.matches(Gio.io_error_quark(), Gio.IOErrorEnum.TIMED_OUT) or \
+                remote == 'org.freedesktop.DBus.Error.NoReply':
+            return DeskctlError(f'Timed out waiting for GNOME Shell: {message}', EXIT_TIMEOUT)
+        return DeskctlError(message)
+
+    def state(self):
+        return self.call('GetState')
+
+    def settle(self, timeout_ms=3000):
+        return self.call('Settle', '(u)', (timeout_ms,), timeout=timeout_ms + 5000)
+
+    def windows(self):
+        return self.call('ListWindows')
+
+    def switch_workspace(self, number, settle=True):
+        result = self.call('SwitchWorkspace', '(i)', (number,))
+        if settle:
+            self.settle()
+        return result
+
+    def restore_workspace(self, previous):
+        """Return to a workspace recorded from GetState, surviving renumbering."""
+        try:
+            result = self.call('ActivateWorkspaceId', '(s)', (previous['active_id'],))
+            exact = True
+        except DeskctlError as error:
+            if error.status != EXIT_NOT_FOUND:
+                raise
+            # The workspace was empty and dynamic workspaces removed it.
+            count = self.state()['workspace']['count']
+            result = self.call('SwitchWorkspace', '(i)', (min(previous['active'], count),))
+            exact = False
+        self.settle()
+        return {'workspace': result['workspace'], 'exact': exact}
+
+    def run(self, argv, **kwargs):
+        return subprocess.run(argv, env=self.env, **kwargs)
+
+    def extensions(self):
+        try:
+            result = self.bus.call_sync(
+                BUS_NAME, '/org/gnome/Shell', 'org.gnome.Shell.Extensions', 'ListExtensions',
+                None, GLib.VariantType('(a{sa{sv}})'), Gio.DBusCallFlags.NONE, 5000, None)
+        except GLib.Error as error:
+            return {'error': error.message}
+        extensions = {}
+        for uuid, info in result.unpack()[0].items():
+            if not info.get('enabled') and info.get('state') != 3:
+                continue
+            entry = {'state': EXTENSION_STATES.get(int(info.get('state', 0)), 'UNKNOWN')}
+            if info.get('error'):
+                entry['error'] = info['error']
+            extensions[uuid] = entry
+        return extensions
+
+
+def resolve_window(target, window):
+    if window != 'focused':
+        return window
+    focus = target.state()['focus']
+    if not focus:
+        raise DeskctlError('No window has focus', EXIT_NOT_FOUND)
+    return focus['id']
+
+
+# ---------------------------------------------------------------- sandbox
+
+def _session_members(sid):
+    members = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / 'stat').read_text()
+        except OSError:
+            continue
+        # Fields after the parenthesised comm: state ppid pgrp session ...
+        fields = stat[stat.rfind(')') + 2:].split()
+        if int(fields[3]) == sid:
+            members.append(int(entry.name))
+    return members
+
+
+def _cmdline(pid):
+    try:
+        return Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
+    except OSError:
+        return []
+
+
+class Sandbox:
+    """A headless gnome-shell with its own bus, dconf database and XDG dirs."""
+
+    def __init__(self, name):
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,32}', name):
+            raise DeskctlError('Sandbox names use 1-32 letters, digits, - or _', EXIT_USAGE)
+        self.name = name
+        self.home = SANDBOX_DIR / name
+        self.runtime = Path(GLib.get_user_runtime_dir()) / f'deskctl-sandbox-{name}'
+        self.state_file = self.home / 'state.json'
+        self.log = self.home / 'shell.log'
+        self.display = f'deskctl-{name}'
+
+    def xdg(self):
+        return {
+            'XDG_CONFIG_HOME': str(self.home / 'config'),
+            'XDG_DATA_HOME': str(self.home / 'data'),
+            'XDG_CACHE_HOME': str(self.home / 'cache'),
+            'XDG_STATE_HOME': str(self.home / 'state'),
+            'XDG_RUNTIME_DIR': str(self.runtime),
+        }
+
+    def base_env(self):
+        # Built from scratch: anything inherited (DBUS_SESSION_BUS_ADDRESS,
+        # XDG_CONFIG_HOME, ...) could route writes to the real session.
+        keep = ('HOME', 'USER', 'LOGNAME', 'LANG', 'LANGUAGE', 'PATH', 'SHELL',
+                'XDG_DATA_DIRS', 'XDG_CONFIG_DIRS')
+        env = {k: v for k, v in os.environ.items() if k in keep or k.startswith('LC_')}
+        env.update(self.xdg())
+        env['DBUS_SESSION_BUS_ADDRESS'] = f'unix:path={self.runtime / "bus"}'
+        env['XDG_SESSION_TYPE'] = 'wayland'
+        env['XDG_CURRENT_DESKTOP'] = 'GNOME'
+        env['XDG_SESSION_DESKTOP'] = 'gnome'
+        return env
+
+    def client_env(self, state=None):
+        env = self.base_env()
+        env['WAYLAND_DISPLAY'] = self.display
+        env['GDK_BACKEND'] = 'wayland'
+        env['DESKCTL_SANDBOX'] = self.name
+        env['DESKCTL_CACHE_DIR'] = str(CACHE_DIR)
+        return env
+
+    def state(self):
+        try:
+            return json.loads(self.state_file.read_text())
+        except (OSError, ValueError):
+            return None
+
+    def running(self, state=None):
+        state = state or self.state()
+        if not state:
+            return False
+        cmd = _cmdline(state['shell_pid'])
+        return bool(cmd) and b'gnome-shell' in cmd[0] and self.display.encode() in cmd
+
+    def _dconf(self, env, *args, input_text=None):
+        return subprocess.run(['dconf', *args], env=env, input=input_text, text=True,
+                              capture_output=True, check=False)
+
+    def start(self, size, scale, fresh, seed, extensions, link_configs, keep_overview, timeout):
+        if self.running():
+            raise DeskctlError(f'Sandbox {self.name!r} is already running', EXIT_USAGE)
+        if fresh:
+            for sub in ('config', 'data', 'cache', 'state'):
+                shutil.rmtree(self.home / sub, ignore_errors=True)
+        if not (EXTENSION_DIR / 'schemas' / 'gschemas.compiled').exists():
+            subprocess.run(['glib-compile-schemas', str(EXTENSION_DIR / 'schemas')], check=True)
+        self._cleanup_runtime()
+        for sub in ('config', 'data/gnome-shell/extensions', 'cache', 'state'):
+            (self.home / sub).mkdir(parents=True, exist_ok=True)
+        self.runtime.mkdir(mode=0o700)
+        env = self.base_env()
+
+        uuids = [UUID]
+        ext_dir = self.home / 'data/gnome-shell/extensions'
+        for link in ext_dir.iterdir():
+            if link.is_symlink():
+                link.unlink()
+        (ext_dir / UUID).symlink_to(EXTENSION_DIR)
+        if seed:
+            user_ext = Path(GLib.get_user_data_dir()) / 'gnome-shell/extensions'
+            for source in sorted(user_ext.iterdir()) if user_ext.is_dir() else []:
+                if source.name != UUID and not (ext_dir / source.name).exists():
+                    (ext_dir / source.name).symlink_to(source.resolve())
+        for path in extensions:
+            path = Path(path).resolve()
+            try:
+                uuid = json.loads((path / 'metadata.json').read_text())['uuid']
+            except (OSError, ValueError, KeyError) as error:
+                raise DeskctlError(f'{path} is not an extension directory: {error}',
+                                   EXIT_USAGE) from None
+            if (path / 'schemas').is_dir() and not (path / 'schemas/gschemas.compiled').exists():
+                print(f'deskctl: warning: {uuid} has uncompiled schemas; run '
+                      f'glib-compile-schemas {path / "schemas"}', file=sys.stderr)
+            dest = ext_dir / uuid
+            if dest.is_symlink():
+                dest.unlink()
+            dest.symlink_to(path)
+            uuids.append(uuid)
+        for name in link_configs:
+            source = Path(GLib.get_user_config_dir()) / name
+            if name in ('dconf', '') or '/' in name.strip('/') or not source.exists():
+                raise DeskctlError(f'Cannot link config dir {name!r}', EXIT_USAGE)
+            dest = self.home / 'config' / name
+            if dest.is_symlink():
+                dest.unlink()
+            elif dest.exists():
+                shutil.rmtree(dest)
+            dest.symlink_to(source)
+
+        self.log.write_text('')
+        log = open(self.log, 'a')
+        dbus = subprocess.Popen(
+            ['dbus-daemon', '--session', '--nofork', '--nopidfile',
+             f'--address=unix:path={self.runtime / "bus"}'],
+            env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+        state = {'name': self.name, 'dbus_pid': dbus.pid, 'shell_pid': 0,
+                 'address': env['DBUS_SESSION_BUS_ADDRESS'], 'display': self.display,
+                 'runtime': str(self.runtime), 'size': size, 'children': [],
+                 'started': time.time()}
+        self.state_file.write_text(json.dumps(state, indent=2))
+        try:
+            self._wait(lambda: (self.runtime / 'bus').exists(), 5, 'the sandbox bus')
+            self._check_isolation(env)
+            if seed:
+                dump = subprocess.run(['dconf', 'dump', '/'], capture_output=True, text=True,
+                                      check=True).stdout
+                self._dconf(env, 'load', '/', input_text=dump)
+                enabled = self._dconf(env, 'read', '/org/gnome/shell/enabled-extensions').stdout
+                existing = re.findall(r"'([^']+)'", enabled)
+                uuids = existing + [u for u in uuids if u not in existing]
+            overrides = (
+                '[org/gnome/shell]\n'
+                f"enabled-extensions={json.dumps(uuids).replace(chr(34), chr(39))}\n"
+                'disable-user-extensions=false\n'
+                "welcome-dialog-last-shown-version='999'\n\n"
+                '[org/gnome/desktop/screensaver]\nlock-enabled=false\n\n'
+                '[org/gnome/desktop/lockdown]\ndisable-lock-screen=true\n\n'
+                '[org/gnome/desktop/session]\nidle-delay=uint32 0\n')
+            result = self._dconf(env, 'load', '/', input_text=overrides)
+            if result.returncode:
+                raise DeskctlError(f'dconf load failed: {result.stderr.strip()}')
+
+            width, height = size.split('x')
+            shell = subprocess.Popen(
+                ['gnome-shell', '--headless', '--wayland', '--no-x11',
+                 '--virtual-monitor', f'{width}x{height}', '--wayland-display', self.display],
+                env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True)
+            state['shell_pid'] = shell.pid
+            self.state_file.write_text(json.dumps(state, indent=2))
+
+            def ready():
+                if shell.poll() is not None:
+                    raise DeskctlError(f'gnome-shell exited with {shell.returncode}; see {self.log}\n'
+                                       + self._log_tail())
+                try:
+                    Target(self).state()
+                    return True
+                except DeskctlError:
+                    return False
+            self._wait(ready, timeout, 'the sandbox shell')
+        except BaseException:
+            self.stop(purge=False, quiet=True)
+            raise
+        finally:
+            log.close()
+
+        target = Target(self)
+        if scale:
+            self._apply_scale(target, scale)
+        info = target.extensions()
+        if info.get(UUID, {}).get('state') != 'ACTIVE':
+            raise DeskctlError(f'{UUID} is not active in the sandbox: {info.get(UUID)}')
+        if not keep_overview:
+            target.call('Overview', '(s)', ('hide',))
+            target.settle()
+        return {'sandbox': self.name, 'size': size, 'scale': scale or 1, 'display': self.display,
+                'address': state['address'], 'log': str(self.log),
+                'extensions': info, 'state': target.state()}
+
+    def _apply_scale(self, target, scale):
+        """Scale the virtual monitor through Mutter's DisplayConfig, as Settings does."""
+        def display_config(method, params=None):
+            return target.bus.call_sync(
+                'org.gnome.Mutter.DisplayConfig', '/org/gnome/Mutter/DisplayConfig',
+                'org.gnome.Mutter.DisplayConfig', method, params, None,
+                Gio.DBusCallFlags.NONE, 5000, None).unpack()
+        serial, monitors, _, _ = display_config('GetCurrentState')
+        (connector, *_), modes, _ = monitors[0]
+        mode = next(m for m in modes if m[6].get('is-current'))
+        supported = mode[5]
+        best = min(supported, key=lambda s: abs(s - scale))
+        if abs(best - scale) > 0.01:
+            raise DeskctlError(f'Scale {scale} is not supported at {mode[1]}x{mode[2]}; choose from '
+                               + ', '.join(f'{s:.4g}' for s in supported), EXIT_USAGE)
+        config = [(0, 0, best, 0, True, [(connector, mode[0], {})])]
+        display_config('ApplyMonitorsConfig', GLib.Variant(
+            '(uua(iiduba(ssa{sv}))a{sv})', (serial, 1, config, {})))
+        expected = round(mode[1] / best)
+        self._wait(lambda: abs(target.state()['stage']['width'] - expected) <= 1, 10,
+                   f'the {best:.4g}x scale to apply')
+
+    def _check_isolation(self, env):
+        """Refuse to go further unless dconf writes land in the sandbox database."""
+        key = '/org/gnome/deskctl/sandbox-canary'
+        self._dconf(env, 'write', key, f"'{self.name}'")
+        real = subprocess.run(['dconf', 'read', key], capture_output=True, text=True).stdout.strip()
+        isolated = (self.home / 'config/dconf/user').exists()
+        self._dconf(env, 'reset', key)
+        if real:
+            subprocess.run(['dconf', 'reset', key], check=False)
+        if real or not isolated:
+            raise DeskctlError('Sandbox dconf is not isolated from the real session; aborting')
+
+    def _wait(self, predicate, timeout, what):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return
+            time.sleep(0.2)
+        raise DeskctlError(f'Timed out after {timeout}s waiting for {what}; see {self.log}',
+                           EXIT_TIMEOUT)
+
+    def _log_tail(self, lines=15):
+        try:
+            return '\n'.join(self.log.read_text(errors='replace').splitlines()[-lines:])
+        except OSError:
+            return ''
+
+    def _cleanup_runtime(self):
+        if self.runtime.exists():
+            shutil.rmtree(self.runtime, ignore_errors=True)
+
+    def stop(self, purge=False, quiet=False):
+        state = self.state()
+        stopped = []
+        if state:
+            # Every process we started leads its own session; its descendants
+            # (Xwayland-less shell helpers, activated services) share it.
+            leaders = [p for p in [state.get('shell_pid'), *state.get('children', []),
+                                   state.get('dbus_pid')] if p]
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                alive = []
+                for leader in leaders:
+                    for pid in _session_members(leader):
+                        try:
+                            os.kill(pid, sig)
+                            alive.append(pid)
+                        except ProcessLookupError:
+                            pass
+                if not alive:
+                    break
+                stopped = stopped or alive
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and any(map(_session_members, leaders)):
+                    time.sleep(0.1)
+            self.state_file.unlink(missing_ok=True)
+        self._cleanup_runtime()
+        if purge and self.home.exists():
+            shutil.rmtree(self.home)
+        if not state and not quiet and not purge:
+            raise DeskctlError(f'Sandbox {self.name!r} is not running', EXIT_NOT_FOUND)
+        return {'sandbox': self.name, 'stopped': bool(stopped), 'purged': purge}
+
+    def spawn(self, argv, wait):
+        state = self.state()
+        if not self.running(state):
+            raise DeskctlError(f'Sandbox {self.name!r} is not running', EXIT_UNAVAILABLE)
+        env = self.client_env(state)
+        if wait:
+            return subprocess.run(argv, env=env).returncode
+        process = subprocess.Popen(argv, env=env, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        state['children'].append(process.pid)
+        self.state_file.write_text(json.dumps(state, indent=2))
+        return process.pid
+
+    @staticmethod
+    def list():
+        items = []
+        for home in sorted(SANDBOX_DIR.iterdir()) if SANDBOX_DIR.is_dir() else []:
+            sandbox = Sandbox(home.name)
+            state = sandbox.state()
+            items.append({'name': home.name, 'running': sandbox.running(state),
+                          'size': state and state.get('size'), 'dir': str(home)})
+        return items
+
+
+# ---------------------------------------------------------------- images
+
+def magick(*args):
+    result = subprocess.run(['magick', *map(str, args)], capture_output=True, text=True)
+    if result.returncode not in (0, 1):  # compare exits 1 when images differ
+        raise DeskctlError(f'ImageMagick failed: {result.stderr.strip()}')
+    return result
+
+
+def label_font():
+    try:
+        font = subprocess.run(['fc-match', '-f', '%{file}', 'monospace:bold'],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        return font if font and Path(font).exists() else None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def draw_grid(path, logical, scale, step):
+    x0, y0, width, height = logical['x'], logical['y'], logical['width'], logical['height']
+    xs = grid_lines(x0, width, step)
+    ys = grid_lines(y0, height, step)
+    img_w, img_h = round(width * scale), round(height * scale)
+    lines = ' '.join(
+        [f'line {round((x - x0) * scale)},0 {round((x - x0) * scale)},{img_h}' for x in xs] +
+        [f'line 0,{round((y - y0) * scale)} {img_w},{round((y - y0) * scale)}' for y in ys])
+    args = [path, '-fill', 'none', '-stroke', 'rgba(255,0,200,0.55)', '-strokewidth', '1']
+    if lines:
+        args += ['-draw', lines]
+    args += ['-stroke', 'none', '-fill', 'white', '-undercolor', 'rgba(0,0,0,0.65)',
+             '-pointsize', str(max(10, round(11 * scale)))]
+    font = label_font()
+    if font:
+        args += ['-font', font]
+    for x in xs:
+        args += ['-annotate', f'+{round((x - x0) * scale) + 2}+{round(12 * scale)}', str(x)]
+    for y in ys:
+        if y != y0:
+            args += ['-annotate', f'+2+{round((y - y0) * scale) - 2}', str(y)]
+    magick(*args, path)
+
+
+def prune_shots():
+    shots = sorted(SHOTS_DIR.glob('*.png'), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in shots[KEEP_SHOTS:]:
+        old.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_status(target, args):
+    result = {'target': target.label}
+    try:
+        result.update(target.state())
+        available = True
+    except DeskctlError as error:
+        result['deskctl'] = {'available': False, 'error': str(error)}
+        available = False
+    result['extensions'] = target.extensions()
+    settings = {}
+    for schema, keys in STATUS_SETTINGS.items():
+        out = target.run(['gsettings', 'list-recursively', schema],
+                         capture_output=True, text=True).stdout
+        values = dict(line.split(' ', 2)[1:] for line in out.splitlines() if line.count(' ') >= 2)
+        settings[schema] = {k: values[k] for k in keys if k in values}
+    result['settings'] = settings
+    emit(result)
+    return 0 if available else EXIT_UNAVAILABLE
+
+
+def cmd_windows(target, args):
+    windows = target.windows()
+    if not args.all:
+        windows = [w for w in windows if w['type'] in USER_WINDOW_TYPES]
+    if args.workspace is not None:
+        windows = [w for w in windows if w['workspace'] in (args.workspace, 'all')]
+    emit_list(windows)
+
+
+def cmd_screenshot(target, args):
+    if args.delay:
+        time.sleep(args.delay)
+    restore = None
+    if args.workspace is not None:
+        active = target.state()['workspace']
+        if args.workspace != active['active']:
+            target.switch_workspace(args.workspace)
+            restore = None if args.stay else active
+    try:
+        options = {'cursor': GLib.Variant('b', args.cursor)}
+        if args.monitor is not None:
+            options['target'] = GLib.Variant('s', 'monitor')
+            options['monitor'] = GLib.Variant('i', args.monitor)
+        elif args.area:
+            options['target'] = GLib.Variant('s', 'area')
+            options.update({k: GLib.Variant('i', v) for k, v in args.area.items()})
+        elif args.window is not None:
+            options['target'] = GLib.Variant('s', 'window')
+            options['window'] = GLib.Variant('t', resolve_window(target, args.window))
+        else:
+            options['target'] = GLib.Variant('s', 'screen')
+
+        if args.output:
+            path = Path(args.output).resolve()
+        else:
+            SHOTS_DIR.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns() % 10**9 // 10**6:03d}'
+            path = SHOTS_DIR / f'{stamp}-{options["target"].unpack()}.png'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, raw = tempfile.mkstemp(prefix='.deskctl-', suffix='.png', dir=path.parent)
+        try:
+            meta = target.call('Screenshot', '(a{sv}h)', (options, 0), fds=[fd])
+        except BaseException:
+            os.unlink(raw)
+            raise
+        finally:
+            os.close(fd)
+        meta['workspace'] = target.state()['workspace']['active']
+    finally:
+        if restore is not None:
+            meta_restore = target.restore_workspace(restore)
+    if restore is not None:
+        meta['restored_workspace'] = meta_restore
+
+    logical = meta['logical']
+    scale = meta['scale']
+    if not args.full_res and abs(scale - 1) > 1e-3:
+        magick(raw, '-filter', 'Lanczos', '-resize',
+               f'{logical["width"]}x{logical["height"]}!', raw)
+        scale = 1.0
+        meta['image'] = {'width': logical['width'], 'height': logical['height']}
+    if args.grid:
+        draw_grid(raw, logical, scale, args.grid)
+    os.replace(raw, path)
+    if not args.output:
+        prune_shots()
+    meta['scale'] = round(scale, 4)
+    meta['grid'] = args.grid
+    meta['path'] = str(path)
+    print(path)
+    print(json.dumps(meta, separators=(',', ':')))
+
+
+def cmd_pixel(target, args):
+    emit(target.call('PickColor', '(ii)', (args.x, args.y)))
+
+
+def cmd_workspace(target, args):
+    state = target.state()
+    active, count = state['workspace']['active'], state['workspace']['count']
+    if args.number is None:
+        emit({'active': active, 'count': count, 'workspaces': state['workspaces']})
+        return
+    number = {'next': active + 1, 'prev': active - 1}.get(args.number)
+    if number is None:
+        if not args.number.isdigit():
+            raise DeskctlError('Workspace must be a number, next or prev', EXIT_USAGE)
+        number = int(args.number)
+    target.switch_workspace(number, settle=not args.no_settle)
+    state = target.state()
+    emit({'active': state['workspace']['active'], 'count': state['workspace']['count']})
+
+
+def cmd_window(target, args):
+    window = resolve_window(target, args.id)
+    calls = []
+    if args.action == 'move':
+        if args.workspace is None and args.rect is None:
+            raise DeskctlError('window move needs --workspace N and/or --rect X,Y,W,H', EXIT_USAGE)
+        if args.workspace is not None:
+            calls.append(('move-workspace', {'workspace': GLib.Variant('i', args.workspace)}))
+        if args.rect is not None:
+            calls.append(('move-resize', {k: GLib.Variant('i', v) for k, v in args.rect.items()}))
+    else:
+        calls.append((args.action, {}))
+    for action, options in calls:
+        target.call('WindowAction', '(tsa{sv})', (window, action, options))
+    if not args.no_settle:
+        target.settle()
+    match = [w for w in target.windows() if w['id'] == window]
+    emit(match[0] if match else {'id': window, 'closed': True})
+
+
+def cmd_overview(target, args):
+    target.call('Overview', '(s)', (args.action,))
+    if not args.no_settle:
+        target.settle()
+    emit(target.state()['overview'])
+
+
+def _find_windows(target, app=None, title=None, wm_class=None):
+    pattern = re.compile(title) if title else None
+    found = []
+    for window in target.windows():
+        if window['type'] not in USER_WINDOW_TYPES:
+            continue
+        if app and window['app_id'] not in (app, f'{app}.desktop'):
+            continue
+        if wm_class and window['wm_class'] != wm_class:
+            continue
+        if pattern and not pattern.search(window['title']):
+            continue
+        found.append(window)
+    return found
+
+
+def cmd_launch(target, args):
+    app_id = args.app if args.app.endswith('.desktop') else f'{args.app}.desktop'
+    before = {w['id'] for w in _find_windows(target, app=app_id)}
+    result = target.call('LaunchApp', '(sb)', (app_id, args.new_window))
+    if args.wait:
+        expect_new = args.new_window or not before
+        deadline = time.monotonic() + args.timeout
+        while True:
+            # A window only counts once Mutter has placed it (non-empty frame).
+            windows = [w for w in _find_windows(target, app=app_id) if w['rect']['width'] > 0]
+            fresh = [w for w in windows if w['id'] not in before]
+            if fresh or (windows and not expect_new):
+                window = (fresh or windows)[-1]
+                # New windows may not get focus without a user activation token.
+                target.call('WindowAction', '(tsa{sv})', (window['id'], 'focus', {}))
+                break
+            if time.monotonic() >= deadline:
+                raise DeskctlError(f'No window from {app_id} after {args.timeout}s', EXIT_TIMEOUT)
+            time.sleep(0.15)
+        target.settle()
+        result['window'] = next(w for w in target.windows() if w['id'] == window['id'])
+    emit(result)
+
+
+def cmd_wait_window(target, args):
+    deadline = time.monotonic() + args.timeout
+    while True:
+        found = [w for w in _find_windows(target, args.app, args.title, args.wm_class)
+                 if args.gone or w['rect']['width'] > 0]
+        if bool(found) != args.gone:
+            emit_list(found)
+            return
+        if time.monotonic() >= deadline:
+            raise DeskctlError('Timed out waiting for the window' + (' to close' if args.gone else ''),
+                               EXIT_TIMEOUT)
+        time.sleep(0.15)
+
+
+def cmd_key(target, args):
+    combos = [parse_combo(combo) for combo in args.combos]
+    target.call('Keys', '(aas)', (combos,), timeout=60000)
+    if not args.no_settle:
+        target.settle()
+    emit({'sent': combos})
+
+
+def cmd_type(target, args):
+    text = args.text + ('\n' if args.enter else '')
+    result = target.call('TypeText', '(s)', (text,), timeout=120000)
+    if not args.no_settle:
+        target.settle()
+    emit(result)
+
+
+def _pointer(target, action, options, settle):
+    variants = {k: GLib.Variant('d' if k in ('x', 'y') else ('s' if k == 'button' else 'i'), v)
+                for k, v in options.items() if v is not None}
+    result = target.call('Pointer', '(sa{sv})', (action, variants))
+    if settle:
+        target.settle()
+    emit(result)
+
+
+def cmd_click(target, args):
+    _pointer(target, 'click', {'x': args.x, 'y': args.y, 'button': args.button,
+                               'count': 2 if args.double else args.count}, not args.no_settle)
+
+
+def cmd_move(target, args):
+    _pointer(target, 'move', {'x': args.x, 'y': args.y}, not args.no_settle)
+
+
+def cmd_drag(target, args):
+    (x1, y1), (x2, y2) = args.start, args.end
+    button = {'button': GLib.Variant('s', args.button)}
+
+    def point(x, y):
+        return {'x': GLib.Variant('d', x), 'y': GLib.Variant('d', y)}
+    target.call('Pointer', '(sa{sv})', ('press', {**point(x1, y1), **button}))
+    try:
+        # Intermediate motion lets drag thresholds and hover effects trigger.
+        for step in range(1, args.steps + 1):
+            t = step / args.steps
+            target.call('Pointer', '(sa{sv})', ('move', point(x1 + (x2 - x1) * t, y1 + (y2 - y1) * t)))
+    finally:
+        result = target.call('Pointer', '(sa{sv})', ('release', button))
+    if not args.no_settle:
+        target.settle()
+    emit(result)
+
+
+def cmd_scroll(target, args):
+    at = {'x': args.at[0], 'y': args.at[1]} if args.at else {}
+    _pointer(target, 'scroll', {**at, 'dx': args.dx, 'dy': args.dy}, not args.no_settle)
+
+
+def cmd_tree(target, args):
+    result = target.call('ShellTree', '(sub)', (args.root, args.depth, args.all))
+    if args.json:
+        emit(result)
+        return
+    print('\n'.join(render_tree(result['tree'])))
+    if result['truncated']:
+        print('(truncated: node limit reached; narrow the root or depth)')
+
+
+def cmd_diff(target, args):
+    a, b = Path(args.a), Path(args.b)
+    for path in (a, b):
+        if not path.is_file():
+            raise DeskctlError(f'No such image {path}', EXIT_USAGE)
+    size_a = magick('identify', '-format', '%w %h', a).stdout.split()
+    size_b = magick('identify', '-format', '%w %h', b).stdout.split()
+    if size_a != size_b:
+        raise DeskctlError(f'Image sizes differ: {"x".join(size_a)} vs {"x".join(size_b)}', EXIT_USAGE)
+    out = Path(args.output) if args.output else b.with_name(f'{b.stem}.diff.png')
+    compare = magick('compare', '-metric', 'AE', '-fuzz', f'{args.fuzz}%', a, b, out)
+    changed = int(float((compare.stderr.strip().split() or ['0'])[0]))
+    width, height = map(int, size_a)
+    bbox = None
+    if changed:
+        trim = magick(a, b, '-compose', 'difference', '-composite', '-colorspace', 'gray',
+                      '-threshold', f'{args.fuzz}%', '-format', '%@', 'info:').stdout.strip()
+        match = re.fullmatch(r'(\d+)x(\d+)\+(\d+)\+(\d+)', trim)
+        if match:
+            w, h, x, y = map(int, match.groups())
+            bbox = {'x': x, 'y': y, 'width': w, 'height': h}
+    emit({'changed_pixels': changed, 'total_pixels': width * height,
+          'percent': round(100 * changed / (width * height), 4), 'bbox': bbox,
+          'diff_image': str(out)})
+
+
+def _settings_file(target, name):
+    if not re.fullmatch(r'[A-Za-z0-9_.-]{1,64}', name):
+        raise DeskctlError('Snapshot names use letters, digits, ., - or _', EXIT_USAGE)
+    return CACHE_DIR / 'settings' / target.label.replace(':', '-') / f'{name}.ini'
+
+
+def _dconf_dump(target, path):
+    result = target.run(['dconf', 'dump', path], capture_output=True, text=True)
+    if result.returncode:
+        raise DeskctlError(f'dconf dump failed: {result.stderr.strip()}')
+    return result.stdout
+
+
+def cmd_settings(target, args):
+    file = _settings_file(target, args.name)
+    if args.action == 'snapshot':
+        file.parent.mkdir(parents=True, exist_ok=True)
+        dump = _dconf_dump(target, '/')
+        file.write_text(dump)
+        emit({'snapshot': args.name, 'file': str(file), 'keys': len(parse_dconf_dump(dump))})
+        return
+    if not file.exists():
+        raise DeskctlError(f'No snapshot {args.name!r}; take one with: deskctl settings snapshot '
+                           f'{args.name}', EXIT_NOT_FOUND)
+    diff = diff_settings(parse_dconf_dump(file.read_text()), parse_dconf_dump(_dconf_dump(target, '/')))
+    if args.prefix:
+        diff = {kind: {k: v for k, v in entries.items() if k.startswith(args.prefix)}
+                for kind, entries in diff.items()}
+    emit(diff)
+
+
+def _mark_file(target):
+    return CACHE_DIR / 'marks' / f'{target.label.replace(":", "-")}.json'
+
+
+def cmd_mark(target, args):
+    mark = {'time': time.time()}
+    if target.sandbox:
+        mark['log_offset'] = target.sandbox.log.stat().st_size
+    file = _mark_file(target)
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(json.dumps(mark))
+    emit(mark)
+
+
+LOG_INTERESTING = re.compile(
+    r'JS ERROR|JS WARNING|Gjs-WARNING|Gjs-CRITICAL|CRITICAL|Error|error|Exception|'
+    r'Traceback|failed|Failed|deskctl|extension|@resource|@file://')
+
+
+def cmd_logs(target, args):
+    mark = None
+    if args.since_mark:
+        try:
+            mark = json.loads(_mark_file(target).read_text())
+        except (OSError, ValueError):
+            raise DeskctlError('No mark yet; run `deskctl mark` first', EXIT_NOT_FOUND) from None
+    if target.sandbox:
+        with open(target.sandbox.log, errors='replace') as log:
+            if mark:
+                log.seek(mark.get('log_offset', 0))
+            lines = log.read().splitlines()
+    else:
+        argv = ['journalctl', '--user', '-b', '--no-pager', '-o', 'short-iso', '_COMM=gnome-shell']
+        if mark:
+            argv += ['--since', f'@{int(mark["time"])}']
+        elif args.since:
+            argv += ['--since', args.since]
+        result = subprocess.run(argv, capture_output=True, text=True)
+        lines = [line for line in result.stdout.splitlines() if not line.startswith('-- ')]
+    if not args.all:
+        lines = [line for line in lines if LOG_INTERESTING.search(line) or line.startswith((' ', '\t'))]
+    print('\n'.join(lines[-args.lines:]))
+
+
+def cmd_sandbox(args):
+    sandbox = Sandbox(args.name)
+    if args.action == 'start':
+        if not re.fullmatch(r'\d{3,5}x\d{3,5}', args.size):
+            raise DeskctlError('--size must be WIDTHxHEIGHT', EXIT_USAGE)
+        emit(sandbox.start(args.size, args.scale, args.fresh, args.seed, args.extension, args.link_config,
+                           args.keep_overview, args.timeout))
+    elif args.action == 'stop':
+        emit(sandbox.stop(purge=args.purge))
+    elif args.action == 'list':
+        emit_list(Sandbox.list())
+    elif args.action == 'env':
+        if not sandbox.running():
+            raise DeskctlError(f'Sandbox {args.name!r} is not running', EXIT_UNAVAILABLE)
+        for key, value in sorted(sandbox.client_env().items()):
+            print(f'export {key}={shlex.quote(value)}')
+    elif args.action == 'run':
+        command = args.run_command[1:] if args.run_command[:1] == ['--'] else args.run_command
+        if not command:
+            raise DeskctlError('Usage: deskctl sandbox run [--name N] [--wait] -- COMMAND ...', EXIT_USAGE)
+        result = sandbox.spawn(command, args.wait)
+        if args.wait:
+            return result
+        emit({'sandbox': args.name, 'pid': result, 'command': command})
+    return 0
+
+
+# ---------------------------------------------------------------- argparse
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog='deskctl',
+        description='Screenshots, workspaces, windows and input for AI agents on GNOME Shell. '
+                    'Coordinates are logical (stage) pixels; workspaces are numbered from 1.')
+    parser.add_argument('--sandbox', metavar='NAME', default=os.environ.get('DESKCTL_SANDBOX'),
+                        help='target a sandbox started with `deskctl sandbox start` '
+                             '(default: $DESKCTL_SANDBOX, else the live session)')
+    sub = parser.add_subparsers(dest='command', required=True, metavar='COMMAND')
+
+    settle = argparse.ArgumentParser(add_help=False)
+    settle.add_argument('--no-settle', action='store_true',
+                        help='return without waiting for animations to finish')
+
+    sub.add_parser('status', help='shell, monitors, workspaces, focus, key settings, extensions')
+
+    p = sub.add_parser('windows', help='list windows (JSON, one per line)')
+    p.add_argument('--workspace', type=positive_int, help='only windows on workspace N')
+    p.add_argument('--all', action='store_true', help='include non-user window types')
+
+    p = sub.add_parser('screenshot', help='capture to PNG; prints the path, then JSON metadata')
+    what = p.add_mutually_exclusive_group()
+    what.add_argument('--monitor', type=int, metavar='INDEX', help='one monitor (0-based)')
+    what.add_argument('--area', type=parse_rect, metavar='X,Y,W,H', help='logical rectangle')
+    what.add_argument('--window', type=parse_window_id, metavar='ID|focused',
+                      help='one window, cropped to its frame')
+    p.add_argument('--workspace', type=positive_int, metavar='N',
+                   help='switch to workspace N for the capture, then switch back')
+    p.add_argument('--stay', action='store_true', help='with --workspace: do not switch back')
+    p.add_argument('--cursor', action='store_true', help='include the pointer')
+    p.add_argument('--full-res', action='store_true',
+                   help='keep physical pixels instead of scaling to logical size')
+    p.add_argument('--grid', type=positive_int, nargs='?', const=100, metavar='STEP',
+                   help='overlay labelled logical-coordinate grid lines (default step 100)')
+    p.add_argument('--delay', type=float, default=0, metavar='SECONDS')
+    p.add_argument('-o', '--output', metavar='PATH', help=f'default: {SHOTS_DIR}/<time>-<target>.png')
+
+    p = sub.add_parser('pixel', help='colour of one logical pixel')
+    p.add_argument('x', type=int)
+    p.add_argument('y', type=int)
+
+    p = sub.add_parser('workspace', parents=[settle], help='print or switch the active workspace')
+    p.add_argument('number', nargs='?', metavar='N|next|prev')
+
+    p = sub.add_parser('window', parents=[settle], help='act on a window')
+    p.add_argument('action', choices=['focus', 'close', 'minimize', 'unminimize', 'maximize',
+                                      'unmaximize', 'fullscreen', 'unfullscreen', 'move'])
+    p.add_argument('id', type=parse_window_id, metavar='ID|focused')
+    p.add_argument('--workspace', type=positive_int, help='move: target workspace')
+    p.add_argument('--rect', type=parse_rect, metavar='X,Y,W,H', help='move: frame geometry')
+
+    p = sub.add_parser('overview', parents=[settle], help='show or hide the overview / app grid')
+    p.add_argument('action', choices=['show', 'hide', 'apps'])
+
+    p = sub.add_parser('launch', help='launch an installed app through GNOME Shell')
+    p.add_argument('app', metavar='APP_ID', help='desktop file id, e.g. org.gnome.Settings')
+    p.add_argument('--new-window', action='store_true', help='open a new window if already running')
+    p.add_argument('--wait', action='store_true', help='wait for its window to appear')
+    p.add_argument('--timeout', type=float, default=15)
+
+    p = sub.add_parser('wait-window', help='wait until a matching window exists (or is gone)')
+    p.add_argument('--app', metavar='APP_ID')
+    p.add_argument('--title', metavar='REGEX')
+    p.add_argument('--wm-class')
+    p.add_argument('--gone', action='store_true', help='wait until no window matches')
+    p.add_argument('--timeout', type=float, default=10)
+
+    p = sub.add_parser('key', parents=[settle], help='press key combos, e.g. super+Return ctrl+l')
+    p.add_argument('combos', nargs='+', metavar='COMBO')
+
+    p = sub.add_parser('type', parents=[settle], help='type text into the focused window')
+    p.add_argument('text')
+    p.add_argument('--enter', action='store_true', help='press Return afterwards')
+
+    p = sub.add_parser('click', parents=[settle], help='click at logical X Y')
+    p.add_argument('x', type=float)
+    p.add_argument('y', type=float)
+    p.add_argument('--button', choices=['left', 'middle', 'right'], default='left')
+    p.add_argument('--double', action='store_true')
+    p.add_argument('--count', type=int, default=1, choices=[1, 2, 3])
+
+    p = sub.add_parser('move', parents=[settle], help='move the pointer to logical X Y')
+    p.add_argument('x', type=float)
+    p.add_argument('y', type=float)
+
+    p = sub.add_parser('drag', parents=[settle], help='press at START, move to END, release')
+    p.add_argument('start', type=float, nargs=2, metavar=('X1', 'Y1'))
+    p.add_argument('end', type=float, nargs=2, metavar=('X2', 'Y2'))
+    p.add_argument('--button', choices=['left', 'middle', 'right'], default='left')
+    p.add_argument('--steps', type=positive_int, default=12)
+
+    p = sub.add_parser('scroll', parents=[settle], help='scroll wheel steps (positive = down/right)')
+    p.add_argument('--dy', type=int, default=0)
+    p.add_argument('--dx', type=int, default=0)
+    p.add_argument('--at', type=float, nargs=2, metavar=('X', 'Y'), help='move there first')
+
+    p = sub.add_parser('tree', help='GNOME Shell actor tree as an outline (or --json)')
+    p.add_argument('root', nargs='?', default='panel',
+                   choices=['panel', 'quick-settings', 'calendar', 'dash', 'overview',
+                            'message-tray', 'ui', 'stage'])
+    p.add_argument('--depth', type=int, default=12)
+    p.add_argument('--all', action='store_true', help='descend into hidden actors')
+    p.add_argument('--json', action='store_true')
+
+    p = sub.add_parser('diff', help='compare two screenshots of the same size')
+    p.add_argument('a')
+    p.add_argument('b')
+    p.add_argument('-o', '--output', metavar='PATH', help='highlight image (default: B.diff.png)')
+    p.add_argument('--fuzz', type=float, default=2, metavar='PERCENT',
+                   help='colour tolerance (default 2)')
+
+    p = sub.add_parser('settings', help='snapshot dconf and diff against it later')
+    p.add_argument('action', choices=['snapshot', 'diff'])
+    p.add_argument('name', nargs='?', default='default')
+    p.add_argument('--prefix', metavar='/org/gnome/...', help='diff: only keys under this path')
+
+    sub.add_parser('mark', help='remember "now" for `logs --since-mark`')
+
+    p = sub.add_parser('logs', help='GNOME Shell log lines (errors and warnings by default)')
+    p.add_argument('--since-mark', action='store_true')
+    p.add_argument('--since', metavar='TIME', help='journalctl time, e.g. "10 min ago"')
+    p.add_argument('--all', action='store_true', help='every line, not just the interesting ones')
+    p.add_argument('--lines', type=positive_int, default=200)
+
+    p = sub.add_parser('sandbox', help='headless GNOME Shell for safe experiments')
+    boxes = p.add_subparsers(dest='action', required=True, metavar='ACTION')
+    named = argparse.ArgumentParser(add_help=False)
+    named.add_argument('-n', '--name', default=None,
+                       help='sandbox name (default: --sandbox, $DESKCTL_SANDBOX or "default")')
+    q = boxes.add_parser('start', parents=[named], help='start a sandbox shell')
+    q.add_argument('--size', default='1920x1080', help='virtual monitor WIDTHxHEIGHT in physical pixels')
+    q.add_argument('--scale', type=float, help='monitor scale, e.g. 2 or 1.6667 (sizes allow '
+                                               'different sets of fractional scales)')
+    q.add_argument('--fresh', action='store_true',
+                   help='discard settings and data left from earlier runs of this sandbox')
+    q.add_argument('--seed', action='store_true',
+                   help='copy your dconf settings and user extensions into the sandbox')
+    q.add_argument('--extension', action='append', default=[], metavar='DIR',
+                   help='link and enable an extension source directory (repeatable)')
+    q.add_argument('--link-config', action='append', default=[], metavar='NAME',
+                   help='symlink ~/.config/NAME into the sandbox (repeatable; writes are real)')
+    q.add_argument('--keep-overview', action='store_true', help='leave the startup overview open')
+    q.add_argument('--timeout', type=float, default=45, help='seconds to wait for the shell')
+    q = boxes.add_parser('stop', parents=[named], help='stop a sandbox and its processes')
+    q.add_argument('--purge', action='store_true', help='also delete its settings and data')
+    boxes.add_parser('list', help='list sandboxes')
+    boxes.add_parser('env', parents=[named], help='print shell exports for running clients by hand')
+    q = boxes.add_parser('run', parents=[named], help='run a Wayland client inside the sandbox')
+    q.add_argument('--wait', action='store_true', help='wait and return its exit status')
+    q.add_argument('run_command', nargs=argparse.REMAINDER, metavar='-- COMMAND',
+                   help='the command and its arguments')
+    return parser
+
+
+COMMANDS = {
+    'status': cmd_status, 'windows': cmd_windows, 'screenshot': cmd_screenshot,
+    'pixel': cmd_pixel, 'workspace': cmd_workspace, 'window': cmd_window,
+    'overview': cmd_overview, 'launch': cmd_launch, 'wait-window': cmd_wait_window,
+    'key': cmd_key, 'type': cmd_type, 'click': cmd_click, 'move': cmd_move,
+    'drag': cmd_drag, 'scroll': cmd_scroll, 'tree': cmd_tree, 'diff': cmd_diff,
+    'settings': cmd_settings, 'mark': cmd_mark, 'logs': cmd_logs,
+}
+
+
+def main(argv=None):
+    if os.getuid() == 0:
+        print('deskctl: run as the desktop user, not root', file=sys.stderr)
+        return 1
+    args = build_parser().parse_args(argv)
+    try:
+        if args.command == 'sandbox':
+            args.name = getattr(args, 'name', None) or args.sandbox or 'default'
+            return cmd_sandbox(args) or 0
+        if args.command == 'diff':
+            return cmd_diff(None, args) or 0
+        target = Target(Sandbox(args.sandbox) if args.sandbox else None)
+        return COMMANDS[args.command](target, args) or 0
+    except DeskctlError as error:
+        print(f'deskctl: {error}', file=sys.stderr)
+        return error.status
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == '__main__':
+    sys.exit(main())
