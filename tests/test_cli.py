@@ -289,6 +289,16 @@ class AccessibilityTests(unittest.TestCase):
             {'role': 'file chooser', 'name': 'File Chooser Widget', 'children': []}]}
         self.assertIs(deskctl.a11y_scope(chooser), chooser)
 
+    def test_wait_states(self):
+        node = {'role': 'button', 'name': 'Create', 'states': ['focused']}
+        self.assertTrue(deskctl.a11y_has_states(node, []))
+        self.assertTrue(deskctl.a11y_has_states(node, ['focused', '!disabled']))
+        self.assertFalse(deskctl.a11y_has_states(node, ['!focused']))
+        self.assertFalse(deskctl.a11y_has_states({'role': 'x', 'name': ''}, ['checked']))
+        args = deskctl.build_parser().parse_args(
+            ['a11y', 'wait', '--name', 'Create', '--state', '!disabled', '--timeout', '3'])
+        self.assertEqual((args.state, args.timeout, args.gone), (['!disabled'], 3.0, False))
+
     def test_outline(self):
         lines = deskctl.render_a11y({'role': 'frame', 'name': 'App', 'rect': [0, 0, 9, 9], 'children': [
             {'role': 'check box', 'name': 'Wrap', 'rect': [1, 2, 3, 4], 'states': ['checked']},

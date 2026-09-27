@@ -66,7 +66,7 @@ than full screens.
 | Type | `deskctl type 'text' [--enter]` |
 | Pointer | `deskctl click X Y [--button right] [--double]` · `deskctl move X Y` · `deskctl drag X1 Y1 X2 Y2` · `deskctl scroll --dy 3 [--at X Y]` · add `--hold ctrl` (or `shift`, `ctrl+shift`, …) to `click`, `drag` or `scroll` to keep keys down throughout |
 | Shell UI as text | `deskctl tree panel\|quick-settings\|calendar\|dash\|overview\|message-tray\|ui\|stage [--depth N] [--all] [--json]` |
-| App controls as text | `deskctl a11y tree [WINDOW] [--all] [--json]` · `deskctl a11y find [WINDOW] --name TEXT [--role ROLE] [--regex]` · `deskctl a11y click [WINDOW] --name TEXT [--role ROLE] [--nth N] [--action] [--double] [--hold KEYS]` · `deskctl a11y focus [WINDOW]` (WINDOW: id or `focused`, the default) |
+| App controls as text | `deskctl a11y tree [WINDOW] [--all] [--json]` · `deskctl a11y find [WINDOW] --name TEXT [--role ROLE] [--regex]` · `deskctl a11y click [WINDOW] --name TEXT [--role ROLE] [--nth N] [--action] [--double] [--hold KEYS]` · `deskctl a11y focus [WINDOW]` · `deskctl a11y wait [WINDOW] --name TEXT [--role ROLE] [--state S] [--gone] [--timeout S]` (WINDOW: id or `focused`, the default) |
 | Settings diff | `deskctl settings snapshot [NAME]` · `deskctl settings diff [NAME] [--prefix /org/gnome/desktop/]` |
 | Shell logs | `deskctl mark` · `deskctl logs [--since-mark] [--since '5 min ago'] [--all]` |
 | Compare images | `deskctl diff A.png B.png [-o OUT] [--fuzz PCT]` |
@@ -118,6 +118,10 @@ deskctl a11y focus                                 # where keys will go, with it
 - Controls scrolled out of view are marked `offscreen`; `click` scrolls them into view first.
 - Run `a11y focus` before `key` or `type` when unsure where keyboard focus is: after typing into
   a field, shortcuts go to that field.
+- Don't `sleep` for apps to catch up. Wait for a new window with `wait-window`, and for anything
+  inside one with `a11y wait`: `--name Create --state '!disabled'` until a button is enabled,
+  `--role dialog --gone` until a dialog closes, `--name '^Saved' --regex` until a label appears.
+  It searches the whole window, prints the matches, and exits 7 on timeout.
 - Popovers and popup menus are marked `popup`, and positions inside them are approximate
   (`[~x,y ...]`, `"approx": true`): GTK4 reports them several pixels off. `click` there runs the
   control's own action (click, activate, toggle) instead of the pointer; `--action` does that

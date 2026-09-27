@@ -21,7 +21,7 @@ tests/smoke.sh
   - only the Quick Settings toggle and the preferences window write the kill switch
   - the extension has no command, eval or file-open surface
 
-`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 48 checks:
+`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 50 checks:
 
 - screenshots at logical and full resolution
 - workspaces and exact restore
@@ -30,7 +30,7 @@ tests/smoke.sh
 - the panel tree
 - the status-area icon, the Quick Settings toggle and all three icon visibility settings
 - pointer accuracy
-- app accessibility trees: reading typed text, clicking buttons by name, same-named wrappers, named popup menu items and actions in popovers, dialog scoping, scrolling out-of-view controls into view
+- app accessibility trees: reading typed text, clicking buttons by name, same-named wrappers, named popup menu items and actions in popovers, dialog scoping, scrolling out-of-view controls into view, waiting for controls to go and timing out
 - keys held through a drag (`--hold super` moves a window; a plain drag doesn't)
 - the kill switch, including refusing `a11y` and interrupting typing and a drag mid-way (which releases held keys too)
 - the shell log

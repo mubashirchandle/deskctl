@@ -1521,6 +1521,8 @@ def _do_action(tree, node):
 
 def cmd_a11y(target, args):
     action = args.a11y_action
+    if action == 'wait':
+        return _a11y_wait(target, args)
     tree = _a11y_window(target, args, action)
     if action == 'tree':
         root = tree.walk(include_hidden=args.all)
@@ -1572,6 +1574,43 @@ def _a11y_find(tree, args):
     root = tree.walk(text_limit=A11Y_FULL_TEXT)
     return a11y_matches(root if args.anywhere else a11y_scope(root),
                         args.name, args.role, args.regex)
+
+
+def a11y_has_states(node, wanted):
+    """Whether NODE has every state in WANTED; '!name' requires its absence."""
+    states = set(node.get('states', []))
+    return all((w[1:] not in states) if w.startswith('!') else (w in states) for w in wanted)
+
+
+def _a11y_wait(target, args):
+    """Poll until a matching control exists (or, with --gone, none does).
+    The whole window is searched: this asks what exists, not what is clickable."""
+    if args.name is None and args.role is None:
+        raise DeskctlError('Give --name, --role or both', EXIT_USAGE)
+    deadline = time.monotonic() + args.timeout
+    while True:
+        try:
+            tree = _a11y_window(target, args, 'wait')
+            root = tree.walk(text_limit=A11Y_FULL_TEXT)
+            nodes = [n for n in a11y_matches(root, args.name, args.role, args.regex)
+                     if a11y_has_states(n, args.state)]
+        except DeskctlError as error:
+            if error.status != EXIT_NOT_FOUND:
+                raise
+            nodes = []  # No such window, or no tree yet.
+        if bool(nodes) != args.gone:
+            emit_list(_found(nodes))
+            return
+        if time.monotonic() >= deadline:
+            raise DeskctlError(f'Timed out after {args.timeout:g}s waiting for the control'
+                               + (' to go' if args.gone else ''), EXIT_TIMEOUT)
+        time.sleep(0.25)
+        # Without a main loop libatspi never hears of changes, so drop what it cached.
+        atspi = _atspi_for(target)
+        context = GLib.MainContext.default()
+        while context.pending():
+            context.iteration(False)
+        atspi.get_desktop(0).clear_cache()
 
 
 def _a11y_pick(tree, args):
@@ -1888,6 +1927,12 @@ def build_parser():
     q.add_argument('--double', action='store_true')
     q.add_argument('--hold', metavar='KEYS', help='keys held while clicking, e.g. ctrl')
     actions.add_parser('focus', parents=[win], help='the control that has keyboard focus, with its text')
+    q = actions.add_parser('wait', parents=[win, match],
+                           help='wait until a matching control exists (searches the whole window)')
+    q.add_argument('--state', action='append', default=[], metavar='STATE',
+                   help="required state, e.g. checked or '!disabled' (repeatable)")
+    q.add_argument('--gone', action='store_true', help='wait until no control matches')
+    q.add_argument('--timeout', type=float, default=10)
 
     p = sub.add_parser('diff', help='compare two screenshots of the same size')
     p.add_argument('a')

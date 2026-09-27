@@ -88,7 +88,7 @@ const XML = `<node><interface name="org.gnome.Shell.Extensions.Deskctl1">
 const WINDOW_TYPES = Object.fromEntries(
     Object.entries(Meta.WindowType).map(([name, value]) => [value, name.toLowerCase()]));
 // What the CLI reads through AT-SPI; named in the activity list.
-const A11Y_ACTIONS = new Set(['tree', 'find', 'click', 'focus']);
+const A11Y_ACTIONS = new Set(['tree', 'find', 'click', 'focus', 'wait']);
 const MAX_SETTLE_MS = 10000;
 const QUIET_MS = 60;
 const MAX_QUIET_WAIT_MS = 750;

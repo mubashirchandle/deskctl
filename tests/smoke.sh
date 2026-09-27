@@ -107,6 +107,12 @@ check 'clicks in a popover run the control action' \
     jq -e '.action and .why' <("$D" a11y click --name 'about calculator')
 check 'an open dialog scopes matching' jq -e 'length == 1' <("$D" a11y find --name close)
 "$D" key Escape >/dev/null
+check 'a11y wait --gone sees the dialog close' "$D" a11y wait --role dialog --gone --timeout 5
+set +e
+"$D" a11y wait --name 'no such control' --timeout 1 >/dev/null 2>&1
+status=$?
+set -e
+check 'a11y wait times out with exit 7' test "$status" = 7
 "$D" launch org.gnome.Settings --wait --timeout 30 >/dev/null
 "$D" a11y click --name system >/dev/null
 check 'a11y click scrolls an out-of-view control into view' \
