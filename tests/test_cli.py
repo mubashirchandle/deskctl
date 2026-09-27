@@ -38,6 +38,10 @@ class KeyComboTests(unittest.TestCase):
         self.assertEqual(deskctl.parse_combo('ctrl++'), ['Control_L', 'plus'])
         self.assertEqual(deskctl.parse_combo('+'), ['plus'])
         self.assertEqual(deskctl.parse_combo('super+.'), ['Super_L', 'period'])
+        self.assertEqual(deskctl.parse_combo('%'), ['percent'])
+        self.assertEqual(deskctl.parse_combo('ctrl+shift+?'), ['Control_L', 'Shift_L', 'question'])
+        self.assertEqual(deskctl.parse_combo('*'), ['asterisk'])
+        self.assertEqual(deskctl.parse_combo('_'), ['underscore'])
 
     def test_raw_keysyms_pass_through(self):
         self.assertEqual(deskctl.parse_combo('XF86AudioMute'), ['XF86AudioMute'])

@@ -94,6 +94,11 @@ PUNCTUATION = {
     '-': 'minus', '=': 'equal', ',': 'comma', '.': 'period', '/': 'slash',
     ';': 'semicolon', "'": 'apostrophe', '[': 'bracketleft', ']': 'bracketright',
     '\\': 'backslash', '`': 'grave',
+    # Shifted characters: the virtual keyboard picks the level itself.
+    '!': 'exclam', '@': 'at', '#': 'numbersign', '$': 'dollar', '%': 'percent',
+    '^': 'asciicircum', '&': 'ampersand', '*': 'asterisk', '(': 'parenleft', ')': 'parenright',
+    '_': 'underscore', '{': 'braceleft', '}': 'braceright', '|': 'bar', ':': 'colon',
+    '"': 'quotedbl', '<': 'less', '>': 'greater', '?': 'question', '~': 'asciitilde',
 }
 
 
