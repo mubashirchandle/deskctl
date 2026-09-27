@@ -7,9 +7,10 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 
+import {Activity} from './activity.js';
 import * as Capture from './capture.js';
-import {Indicator} from './indicator.js';
 import {Input} from './input.js';
+import {AgentAccessIndicator} from './quickSettings.js';
 import {
     DeskctlError, ERROR_PREFIX, Sources,
     allWindows, findWindow, workspaceByNumber, workspaceNumber,
@@ -83,6 +84,43 @@ const XML = `<node><interface name="org.gnome.Shell.Extensions.Deskctl1">
 const WINDOW_TYPES = Object.fromEntries(
     Object.entries(Meta.WindowType).map(([name, value]) => [value, name.toLowerCase()]));
 const MAX_SETTLE_MS = 10000;
+const QUIET_MS = 60;
+const MAX_QUIET_WAIT_MS = 750;
+
+// Programs between an agent and the D-Bus call; the first ancestor not in
+// this set (claude, codex, a terminal...) is what the user wants to see.
+const INTERMEDIARIES = new Set([
+    'deskctl', 'python3', 'python', 'bash', 'sh', 'dash', 'zsh', 'fish', 'env',
+    'timeout', 'xargs', 'nohup', 'setsid', 'uv', 'uvx', 'node',
+]);
+
+function readProc(pid, file) {
+    const [, bytes] = GLib.file_get_contents(`/proc/${pid}/${file}`);
+    return new TextDecoder().decode(bytes);
+}
+
+function programName(pid) {
+    // Some programs rewrite argv[0] as a title ("claude bg-pty-host").
+    const argv0 = readProc(pid, 'cmdline').split('\0')[0].split(' ')[0];
+    return GLib.path_get_basename(argv0 || readProc(pid, 'comm').trim());
+}
+
+function parentPid(pid) {
+    const stat = readProc(pid, 'stat');
+    return Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
+}
+
+function agentName(pid) {
+    let current = pid;
+    for (let depth = 0; depth < 12 && current > 1; depth++) {
+        const name = programName(current);
+        // Versioned binaries (Claude Code runs as e.g. "2.1.283") say nothing.
+        if (!INTERMEDIARIES.has(name) && !/^\d+(\.\d+)+$/.test(name))
+            return name;
+        current = parentPid(current);
+    }
+    return programName(pid);
+}
 
 function unpackOptions(options) {
     return Object.fromEntries(Object.entries(options).map(
@@ -121,13 +159,14 @@ class Service {
         this._input = new Input(this._sources);
         this._tracker = Shell.WindowTracker.get_default();
         this._callers = new Map();
+        this._paintWatches = new Set();
         // Dynamic workspaces renumber as empty ones vanish; these opaque ids
         // follow the Meta.Workspace object so callers can restore exactly.
         this._workspaceIds = new WeakMap();
         this._nextWorkspaceId = 0;
 
-        this.indicator = new Indicator(this._settings, this._sources);
-        Main.panel.addToStatusArea(extension.uuid, this.indicator);
+        this._activity = new Activity(this._sources);
+        this._indicator = new AgentAccessIndicator(extension, this._settings, this._activity);
 
         this._dbus = Gio.DBusExportedObject.wrapJSObject(XML, this);
         this._dbus.export(Gio.DBus.session, OBJECT_PATH);
@@ -137,8 +176,11 @@ class Service {
         this._dbus.unexport();
         this._dbus = null;
         this._input.destroy();
-        this.indicator.destroy();
-        this.indicator = null;
+        this._paintWatches.forEach(id => global.stage.disconnect(id));
+        this._paintWatches.clear();
+        this._indicator.destroy();
+        this._indicator = null;
+        this._activity.destroy();
         this._sources.destroy();
         this._settings = null;
     }
@@ -153,9 +195,7 @@ class Service {
                 'org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
                 'GetConnectionUnixProcessID', new GLib.Variant('(s)', [sender]),
                 null, Gio.DBusCallFlags.NONE, 1000, null);
-            const [pid] = reply.deepUnpack();
-            const [, bytes] = GLib.file_get_contents(`/proc/${pid}/comm`);
-            label = `${new TextDecoder().decode(bytes).trim()} (pid ${pid})`;
+            label = agentName(reply.deepUnpack()[0]);
         } catch {
             // Identity is informational; an unknown caller is still reported.
         }
@@ -178,8 +218,8 @@ class Service {
                 }
             }
             if (activity)
-                this.indicator.activity(name, await this._caller(invocation));
-            const result = await (hold ? this.indicator.hold(handler()) : handler());
+                this._activity.record(name, await this._caller(invocation));
+            const result = await (hold ? this._activity.hold(handler()) : handler());
             invocation.return_value(new GLib.Variant('(s)', [JSON.stringify(result)]));
         } catch (error) {
             if (error instanceof DeskctlError) {
@@ -219,6 +259,11 @@ class Service {
             extension_version: this._extension.metadata.version,
             shell_version: Config.PACKAGE_VERSION,
             enabled: this._settings.get_boolean('enabled'),
+            indicator: {
+                visibility: this._settings.get_string('indicator-visibility'),
+                visible: this._indicator.iconVisible,
+                agent_active: this._activity.active,
+            },
             locked: Main.sessionMode.isLocked,
             session_mode: Main.sessionMode.currentMode,
             stage: {width: global.stage.width, height: global.stage.height},
@@ -265,7 +310,34 @@ class Service {
         }
         await this._sources.frame();
         await this._sources.frame();
-        return {settled: true, waited_ms: Math.round((GLib.get_monotonic_time() - start) / 1000)};
+        const quiet = await this._quiet(QUIET_MS, Math.min(MAX_QUIET_WAIT_MS,
+            Math.max(0, (deadline - GLib.get_monotonic_time()) / 1000)));
+        return {
+            settled: quiet,
+            waited_ms: Math.round((GLib.get_monotonic_time() - start) / 1000),
+        };
+    }
+
+    // Menus and other UI animations have no common "busy" flag, but they all
+    // repaint the stage every frame: wait for a short stretch with no paints.
+    async _quiet(quietMs, capMs) {
+        let lastPaint = GLib.get_monotonic_time();
+        const id = global.stage.connect('after-paint', () => {
+            lastPaint = GLib.get_monotonic_time();
+        });
+        this._paintWatches.add(id);
+        try {
+            const deadline = GLib.get_monotonic_time() + capMs * 1000;
+            while (GLib.get_monotonic_time() - lastPaint < quietMs * 1000) {
+                if (GLib.get_monotonic_time() >= deadline)
+                    return false;
+                await this._sources.sleep(15);
+            }
+            return true;
+        } finally {
+            if (this._paintWatches.delete(id))
+                global.stage.disconnect(id);
+        }
     }
 
     GetStateAsync(_params, invocation) {

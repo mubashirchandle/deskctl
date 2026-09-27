@@ -1,12 +1,4 @@
-.deskctl-indicator .system-status-icon {
-    opacity: 0.45;
-}
-
-.deskctl-indicator.deskctl-active .system-status-icon {
-    opacity: 1;
+/* The status-area eye turns red while an agent is capturing or sending input. */
+.deskctl-active {
     color: #f66151;
-}
-
-.deskctl-indicator.deskctl-disabled .system-status-icon {
-    opacity: 0.9;
 }

@@ -43,6 +43,12 @@ class KeyComboTests(unittest.TestCase):
         self.assertEqual(deskctl.parse_combo('XF86AudioMute'), ['XF86AudioMute'])
         self.assertEqual(deskctl.parse_combo('Super_R'), ['Super_R'])
 
+    def test_accelerators(self):
+        self.assertEqual(deskctl.accel_to_combo('<Super>s'), ['Super_L', 's'])
+        self.assertEqual(deskctl.accel_to_combo('<Primary><Alt>t'), ['Control_L', 'Alt_L', 't'])
+        self.assertIsNone(deskctl.accel_to_combo(''))
+        self.assertIsNone(deskctl.accel_to_combo('<Hyper>x'))
+
     def test_rejects_malformed(self):
         # Unknown-but-well-formed names (f36) pass through; the extension rejects them.
         for combo in ('', 'ctrl+', '+ctrl', 'ctrl++alt', 'ctrl+é', 'bad!key'):
@@ -219,12 +225,14 @@ class InvariantTests(unittest.TestCase):
         self.assertTrue(called)
         self.assertLessEqual(called, methods)
 
-    def test_only_the_indicator_writes_the_kill_switch(self):
-        # The D-Bus API must offer no way to re-enable itself.
+    def test_only_user_interfaces_write_the_kill_switch(self):
+        # The D-Bus API must offer no way to re-enable itself: only the Quick
+        # Settings toggle and the preferences window may.
+        writers = {'quickSettings.js', 'prefs.js'}
+        write = re.compile(r"set_boolean\('enabled'|bind\('enabled'")
         for path in (ROOT / 'extension').glob('*.js'):
-            source = path.read_text()
-            writes = re.findall(r"set_boolean\('enabled'", source)
-            self.assertEqual(len(writes), 1 if path.name == 'indicator.js' else 0, path.name)
+            found = bool(write.search(path.read_text()))
+            self.assertEqual(found, path.name in writers, path.name)
         self.assertNotIn('org.gnome.shell.extensions.deskctl', CLI_SOURCE)
 
     def test_no_code_evaluation_surface(self):

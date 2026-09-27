@@ -6,5 +6,15 @@
       <summary>Allow agent access</summary>
       <description>When false, every Deskctl D-Bus method except GetState is refused. Toggled from the top-bar indicator; deskctl never writes this key.</description>
     </key>
+    <key name="indicator-visibility" type="s">
+      <choices>
+        <choice value="always"/>
+        <choice value="enabled"/>
+        <choice value="active"/>
+      </choices>
+      <default>'always'</default>
+      <summary>When to show the top-bar indicator</summary>
+      <description>"always"; "enabled" while agent access is allowed; or "active" only while an agent is using the desktop. The Quick Settings toggle is always available.</description>
+    </key>
   </schema>
 </schemalist>
