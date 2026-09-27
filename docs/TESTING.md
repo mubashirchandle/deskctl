@@ -21,7 +21,7 @@ tests/smoke.sh
   - only the Quick Settings toggle and the preferences window write the kill switch
   - the extension has no command, eval or file-open surface
 
-`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 32 checks:
+`smoke.sh` starts a fresh `smoke` sandbox (1600×1000 at 1.25×) and runs 36 checks:
 
 - screenshots at logical and full resolution
 - workspaces and exact restore
@@ -30,7 +30,7 @@ tests/smoke.sh
 - the panel tree
 - the status-area icon, the Quick Settings toggle and all three icon visibility settings
 - pointer accuracy
-- the kill switch
+- the kill switch, including interrupting typing and a drag mid-way
 - the shell log
 
 Its last check confirms your real dconf database is byte-for-byte unchanged. That can fail

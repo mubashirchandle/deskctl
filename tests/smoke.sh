@@ -109,6 +109,24 @@ check 'status still works when switched off' jq -e '.enabled == false' <("$D" st
 kill_switch true
 check 'calls work again after re-enabling' "$D" screenshot -o "$tmp/again.png"
 
+# Switching off must also stop input that is already under way.
+( rc=0; "$D" type "$(printf 'x%.0s' $(seq 300))" >/dev/null 2>"$tmp/type.err" || rc=$?
+  echo "$rc" >"$tmp/type.rc" ) &
+sleep 1
+kill_switch false
+wait
+check 'switching off stops typing mid-way with exit 4' test "$(cat "$tmp/type.rc")" = 4
+check 'the interrupted command says how far it got' grep -q 'stopped after [0-9]* of 300' "$tmp/type.err"
+check 'no key is left held' jq -e '.held_input == {"keys":0,"buttons":0}' <("$D" status)
+kill_switch true
+( "$D" drag 300 300 900 600 --steps 200 >/dev/null 2>&1 || true ) &
+sleep 0.6
+kill_switch false
+wait
+check 'switching off mid-drag releases the mouse button' \
+    jq -e '.held_input == {"keys":0,"buttons":0}' <("$D" status)
+kill_switch true
+
 check 'no deskctl JS errors in the shell log' bash -c "! '$D' logs --all | grep -E 'JS ERROR|Deskctl ' "
 check 'real dconf database unchanged' test "$(dconf dump / | sha256sum)" = "$real_before"
 printf '\n%d checks passed\n' "$passed"

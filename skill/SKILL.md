@@ -20,7 +20,8 @@ Run `deskctl --help` or `deskctl COMMAND --help` for all flags.
   when done (`deskctl workspace N`, `deskctl window focus ID`). `screenshot --workspace N`
   already switches back by itself.
 - **Exit status 4 means the user switched agent access off** with the **Agents** toggle in
-  Quick Settings. Stop and tell them. Never re-enable it yourself: don't click that toggle,
+  Quick Settings, possibly in the middle of your command (typing or a drag stops part-way and
+  the message says how far it got). Stop and tell them. Never re-enable it yourself: don't click that toggle,
   open the extension's preferences, or touch the `org.gnome.shell.extensions.deskctl`
   `enabled` key. Status 3 means the extension or
   sandbox isn't running; 5 locked session; 6 not found; 7 timeout; 2 bad arguments.

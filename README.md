@@ -74,6 +74,11 @@ calling program (`claude`, `codex`, …) and a link to the preferences. When the
 - `deskctl` exits with status 4,
 - the agent skill tells agents to stop and ask you.
 
+Switching off also stops input already under way: typing or a drag halts at its next
+keystroke or pointer step, every key and mouse button the agent holds is released, and the
+interrupted command exits with status 4 saying how far it got (for example "stopped after 43 of
+200 characters"). Captures and window actions take milliseconds, so they simply finish.
+
 No D-Bus method can turn access back on. Only the toggle can, or the preferences window
 (`gnome-extensions prefs deskctl@local`).
 
