@@ -1353,7 +1353,8 @@ class A11yWindow:
         self.truncated = False
         self.nodes = {}  # id(info) -> accessible, for acting on a match
         mapping = (self.origin[0], self.origin[1], 0, 0, 1)
-        return self._walk(self.frame, include_hidden, text_limit, None, None, mapping, False)[0]
+        root = self._walk(self.frame, include_hidden, text_limit, None, None, mapping, False)[0]
+        return a11y_label_fields(root)
 
     def _walk(self, node, include_hidden, text_limit, parent_name, parent_box, mapping, approx):
         """MAPPING (ax, ay, bx, by, k) turns extents into stage coordinates:
@@ -1424,20 +1425,52 @@ def a11y_scope(root):
 
 
 def _norm(text):
-    return ' '.join(text.replace('-', ' ').replace('_', ' ').split()).casefold()
+    return ' '.join(text.replace('-', ' ').replace('_', ' ').split()).casefold().rstrip(':').rstrip()
 
 
 def _labels(node):
-    # Icon-only buttons and bare fields are known by their tooltip's first line.
-    return [node['name']] if node['name'] else [
-        node.get('text', ''), node.get('description', '').split('\n')[0]]
+    # Icon-only buttons and bare fields are known by their tooltip's first line,
+    # or by the label placed beside them.
+    if node['name']:
+        return [node['name'], node.get('label', '')]
+    return [node.get('label', ''), node.get('text', ''), node.get('description', '').split('\n')[0]]
+
+
+A11Y_FIELD_ROLES = {'text', 'entry', 'spin button', 'combo box', 'slider', 'password text'}
+
+
+def a11y_label_fields(root):
+    """Give fields the text of the label just left of them on the same row,
+    else just above them: apps often place a label without linking it, and
+    name a dropdown after its current value."""
+    nodes = list(flatten_a11y(root))
+    labels = [n for n in nodes if n['role'] in ('label', 'static') and n['name'] and n.get('rect')]
+    for field in nodes:
+        if field['role'] not in A11Y_FIELD_ROLES or not field.get('rect'):
+            continue
+        fx, fy, fw, fh = field['rect']
+        best = None
+        for label in labels:
+            lx, ly, lw, lh = label['rect']
+            if fy <= ly + lh / 2 <= fy + fh and 0 <= fx - (lx + lw) <= 40:
+                gap = fx - (lx + lw)  # Left of it, on the same row.
+            elif fx - 10 <= lx <= fx + fw and 0 <= fy - (ly + lh) <= 30:
+                gap = 100 + fy - (ly + lh)  # Above it; only when nothing is to the left.
+            else:
+                continue
+            if best is None or gap < best[0]:
+                best = (gap, label['name'])
+        if best and _norm(best[1]) != _norm(field['name']):
+            field['label'] = best[1]
+    return root
 
 
 def a11y_matches(scope, name=None, role=None, regex=False):
     """Nodes under SCOPE (not SCOPE itself) whose name (exact, ignoring case;
     or a regex search) and role match. Unnamed nodes match on their text or
     their description's first line. A match wrapping a same-named match (a
-    switch row around its switch) gives way to the inner, actual control."""
+    switch row around its switch) gives way to the inner, actual control,
+    and a label to the field it names."""
     pattern = re.compile(name, re.I) if name is not None and regex else None
     found = []
     for node in list(flatten_a11y(scope))[1:]:
@@ -1452,9 +1485,12 @@ def a11y_matches(scope, name=None, role=None, regex=False):
                 continue
         found.append(node)
     ids = {id(n) for n in found}
+    # A label that names a matched field gives way to the field.
+    field_labels = {n['label'] for n in found if n.get('label')}
     return [n for n in found if not any(
         id(inner) in ids and _norm(_labels(inner)[0]) == _norm(_labels(n)[0])
-        for inner in list(flatten_a11y(n))[1:])]
+        for inner in list(flatten_a11y(n))[1:])
+        and not (n['role'] in ('label', 'static') and n['name'] in field_labels)]
 
 
 def render_a11y(node, depth=0, lines=None):
@@ -1462,6 +1498,8 @@ def render_a11y(node, depth=0, lines=None):
     parts = [node['role']]
     if node['name']:
         parts.append(json.dumps(node['name'], ensure_ascii=False))
+    if node.get('label'):
+        parts.append('label=' + json.dumps(node['label'], ensure_ascii=False))
     if node.get('rect'):
         x, y, w, h = node['rect']
         parts.append(f"[{'~' if node.get('approx') else ''}{x},{y} {w}x{h}]")

@@ -293,6 +293,37 @@ class AccessibilityTests(unittest.TestCase):
             {'role': 'file chooser', 'name': 'File Chooser Widget', 'children': []}]}
         self.assertIs(deskctl.a11y_scope(chooser), chooser)
 
+    def test_unnamed_fields_take_the_label_beside_or_above_them(self):
+        tree = {'role': 'frame', 'name': 'W', 'children': [
+            # Inkscape: label, then field, on one row.
+            {'role': 'label', 'name': 'Rx:', 'rect': [385, 142, 23, 34]},
+            {'role': 'spin button', 'name': '', 'text': '0.000', 'rect': [408, 142, 133, 34]},
+            # LibreOffice: the field comes first in the tree, its label sits to its left.
+            {'role': 'spin button', 'name': '', 'text': '96.00', 'rect': [1235, 371, 205, 34]},
+            {'role': 'label', 'name': 'DPI', 'rect': [1184, 378, 41, 19]},
+            # A label above a field.
+            {'role': 'label', 'name': 'Filename', 'rect': [10, 500, 80, 18]},
+            {'role': 'text', 'name': '', 'rect': [10, 524, 300, 30]},
+            # Too far away to be its label, and a named field keeps its name.
+            {'role': 'label', 'name': 'Far', 'rect': [0, 700, 20, 20]},
+            {'role': 'text', 'name': '', 'rect': [200, 700, 100, 20]},
+            {'role': 'spin button', 'name': 'Rows:', 'rect': [60, 800, 50, 20]},
+            {'role': 'label', 'name': 'Rows:', 'rect': [0, 800, 55, 20]},
+            # A dropdown named after its current value keeps it, and gains its label.
+            {'role': 'label', 'name': 'Canvas', 'rect': [481, 462, 115, 46]},
+            {'role': 'combo box', 'name': 'light', 'rect': [604, 462, 450, 46]},
+        ]}
+        deskctl.a11y_label_fields(tree)
+        fields = [n.get('label') for n in tree['children'] if n['role'] != 'label']
+        self.assertEqual(fields, ['Rx:', 'DPI', 'Filename', None, None, 'Canvas'])
+        self.assertEqual(deskctl.a11y_matches(tree, 'canvas')[0]['name'], 'light')
+        self.assertEqual(deskctl.a11y_matches(tree, 'light')[0]['role'], 'combo box')
+        self.assertEqual(deskctl.a11y_matches(tree, 'rx')[0]['text'], '0.000')
+        self.assertEqual(deskctl.a11y_matches(tree, 'dpi', 'spin button')[0]['text'], '96.00')
+        self.assertEqual(deskctl.a11y_matches(tree, 'rows', 'spin button')[0]['name'], 'Rows:')
+        self.assertIn('  spin button label="Rx:" [408,142 133x34] text="0.000"',
+                      deskctl.render_a11y(tree))
+
     def test_wait_states(self):
         node = {'role': 'button', 'name': 'Create', 'states': ['focused']}
         self.assertTrue(deskctl.a11y_has_states(node, []))

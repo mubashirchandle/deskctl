@@ -109,8 +109,10 @@ deskctl a11y find --role 'check box' --name Wrap   # JSON with rect, center, sta
 deskctl a11y focus                                 # where keys will go, with its text
 ```
 
-- `--name` matches the whole name ignoring case; unnamed controls match on their text or their
-  tooltip's first line. `--regex` searches instead. Several matches make `click` fail with a
+- `--name` matches the whole name ignoring case and a trailing colon; unnamed controls match on
+  their text or their tooltip's first line. Fields and dropdowns also match on the label shown
+  beside or above them (`label="Rx:"` in the outline), so `--name Rx --role 'spin button'` works
+  even when the app doesn't link the two. `--regex` searches instead. Several matches make `click` fail with a
   numbered list; narrow with `--role` or pick with `--nth N`. A control wrapped in a same-named
   container (a switch row and its switch) counts once, as the inner control.
 - While a popover or an in-window dialog is open, `find` and `click` search only it (it covers the
