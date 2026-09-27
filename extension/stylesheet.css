@@ -1,0 +1,12 @@
+.deskctl-indicator .system-status-icon {
+    opacity: 0.45;
+}
+
+.deskctl-indicator.deskctl-active .system-status-icon {
+    opacity: 1;
+    color: #f66151;
+}
+
+.deskctl-indicator.deskctl-disabled .system-status-icon {
+    opacity: 0.9;
+}

@@ -1,0 +1,8 @@
+{
+  "uuid": "deskctl@local",
+  "name": "Deskctl",
+  "description": "D-Bus API that lets local AI agents capture the screen, manage workspaces and windows, and inject input, with a top-bar activity indicator and kill switch.",
+  "shell-version": ["50"],
+  "settings-schema": "org.gnome.shell.extensions.deskctl",
+  "version": 1
+}

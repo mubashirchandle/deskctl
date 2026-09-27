@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.deskctl" path="/org/gnome/shell/extensions/deskctl/">
+    <key name="enabled" type="b">
+      <default>true</default>
+      <summary>Allow agent access</summary>
+      <description>When false, every Deskctl D-Bus method except GetState is refused. Toggled from the top-bar indicator; deskctl never writes this key.</description>
+    </key>
+  </schema>
+</schemalist>
