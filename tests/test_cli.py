@@ -240,24 +240,40 @@ class AccessibilityTests(unittest.TestCase):
     ]}
 
     def test_matching(self):
-        nodes = list(deskctl.flatten_a11y(self.TREE))
+        match = deskctl.a11y_matches
         names = lambda found: [n['name'] for n in found]  # noqa: E731
-        self.assertEqual(names(deskctl.a11y_matches(nodes, 'main menu')), ['Main Menu'])
-        self.assertEqual(names(deskctl.a11y_matches(nodes, 'Main', regex=True)), ['Main Menu'])
-        self.assertEqual(names(deskctl.a11y_matches(nodes, None, 'Toggle-Button')), ['Main Menu', ''])
-        self.assertEqual(len(deskctl.a11y_matches(nodes, 'close')), 2)
-        self.assertEqual(deskctl.a11y_matches(nodes, 'hello')[0]['role'], 'text')
-        self.assertEqual(deskctl.a11y_matches(nodes, 'mai'), [])
-        self.assertEqual(len(deskctl.a11y_matches(nodes, 'snapping')), 1)
-        self.assertEqual(deskctl.a11y_matches(nodes, 'toggle snapping (%)'), [])
-        self.assertEqual(deskctl.a11y_matches(nodes, 'width of selection')[0]['text'], '67.0')
-        self.assertEqual(deskctl.a11y_matches(nodes, '67.0')[0]['role'], 'spin button')
+        self.assertEqual(names(match(self.TREE, 'main menu')), ['Main Menu'])
+        self.assertEqual(names(match(self.TREE, 'Main', regex=True)), ['Main Menu'])
+        self.assertEqual(names(match(self.TREE, None, 'Toggle-Button')), ['Main Menu', ''])
+        self.assertEqual(len(match(self.TREE, 'close')), 2)
+        self.assertEqual(match(self.TREE, 'hello')[0]['role'], 'text')
+        self.assertEqual(match(self.TREE, 'mai'), [])
+        self.assertEqual(len(match(self.TREE, 'snapping')), 1)
+        self.assertEqual(match(self.TREE, 'toggle snapping (%)'), [])
+        self.assertEqual(match(self.TREE, 'width of selection')[0]['text'], '67.0')
+        self.assertEqual(match(self.TREE, '67.0')[0]['role'], 'spin button')
+        # The window itself is never a match, whatever its title.
+        self.assertEqual(match(self.TREE, 'app'), [])
 
-    def test_open_dialog_scopes_matching(self):
+    def test_nested_same_named_matches_give_way_to_the_inner_control(self):
+        row = {'role': 'switch', 'name': 'Week Day', 'rect': [0, 0, 500, 50], 'children': [
+            {'role': 'switch', 'name': 'Week Day', 'rect': [450, 10, 40, 20]}]}
+        button = {'role': 'button', 'name': 'x', 'children': [
+            {'role': 'toggle button', 'name': 'x', 'rect': [1, 1, 5, 5]}]}
+        tree = {'role': 'frame', 'name': 'W', 'children': [row, button]}
+        self.assertEqual([n['rect'] for n in deskctl.a11y_matches(tree, 'week day')],
+                         [[450, 10, 40, 20]])
+        self.assertEqual([n['role'] for n in deskctl.a11y_matches(tree, 'x')], ['toggle button'])
+        self.assertEqual([n['role'] for n in deskctl.a11y_matches(tree, 'x', 'button')], ['button'])
+
+    def test_open_dialog_or_popover_scopes_matching(self):
         scope = deskctl.a11y_scope(self.TREE)
         self.assertEqual(scope['name'], 'About')
-        found = deskctl.a11y_matches(deskctl.flatten_a11y(scope), 'close')
-        self.assertEqual([n['rect'] for n in found], [[60, 60, 30, 30]])
+        self.assertEqual([n['rect'] for n in deskctl.a11y_matches(scope, 'close')], [[60, 60, 30, 30]])
+        popover = {'role': 'panel', 'name': '', 'states': ['popup'], 'children': [
+            {'role': 'button', 'name': 'Rename'}]}
+        with_popover = {**self.TREE, 'children': self.TREE['children'] + [popover]}
+        self.assertIs(deskctl.a11y_scope(with_popover), popover)
         no_dialog = {**self.TREE, 'children': self.TREE['children'][:5]}
         self.assertIs(deskctl.a11y_scope(no_dialog), no_dialog)
         chooser = {'role': 'file chooser', 'name': 'Save', 'children': [
@@ -268,10 +284,13 @@ class AccessibilityTests(unittest.TestCase):
     def test_outline(self):
         lines = deskctl.render_a11y({'role': 'frame', 'name': 'App', 'rect': [0, 0, 9, 9], 'children': [
             {'role': 'check box', 'name': 'Wrap', 'rect': [1, 2, 3, 4], 'states': ['checked']},
-            {'role': 'password text', 'name': '', 'text': '(hidden)'}]})
-        self.assertEqual(lines, ['frame "App" [0,0 9x9]',
-                                 '  check box "Wrap" [1,2 3x4] checked',
-                                 '  password text text="(hidden)"'])
+            {'role': 'password text', 'name': '', 'text': '(hidden)'},
+            {'role': 'menu item', 'name': 'Help', 'rect': [5, 6, 7, 8], 'approx': True,
+             'description': 'x' * 100}]})
+        self.assertEqual(lines[:3], ['frame "App" [0,0 9x9]',
+                                     '  check box "Wrap" [1,2 3x4] checked',
+                                     '  password text text="(hidden)"'])
+        self.assertEqual(lines[3], '  menu item "Help" [~5,6 7x8] desc="' + 'x' * 80 + '…"')
 
     def test_sandbox_apps_get_a_private_accessibility_bus(self):
         sandbox = deskctl.Sandbox('iso')

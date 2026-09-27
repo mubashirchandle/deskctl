@@ -95,15 +95,23 @@ check 'screenshot on another workspace restores exactly' \
 check 'still on workspace 1' jq -e '.workspace.active == 1' <("$D" status)
 
 check 'a11y tree lists the calculator keys' grep -q '^  button "7" \[' <("$D" a11y tree)
+check 'a same-named wrapper counts once, as the inner control' \
+    jq -e 'length == 1 and .[0].role == "toggle button"' <("$D" a11y find --name x)
 "$D" a11y click --name 7 --role button >/dev/null
 "$D" a11y click --name 7 --role button >/dev/null
 check 'a11y click lands on the named button' jq -e '.text == "77"' <("$D" a11y focus)
 "$D" a11y click --name 'main menu' --role 'toggle button' >/dev/null
 check 'popup menu items get their label as name' \
-    jq -e 'length == 1' <("$D" a11y find --role 'menu item' --name 'about calculator')
-"$D" a11y click --name 'about calculator' --action >/dev/null
+    jq -e 'length == 1 and .[0].approx' <("$D" a11y find --role 'menu item' --name 'about calculator')
+check 'clicks in a popover run the control action' \
+    jq -e '.action and .why' <("$D" a11y click --name 'about calculator')
 check 'an open dialog scopes matching' jq -e 'length == 1' <("$D" a11y find --name close)
 "$D" key Escape >/dev/null
+"$D" launch org.gnome.Settings --wait --timeout 30 >/dev/null
+"$D" a11y click --name system >/dev/null
+check 'a11y click scrolls an out-of-view control into view' \
+    jq -e 'length == 1' <("$D" a11y find --name 'date & time' --role button)
+"$D" window close focused >/dev/null
 
 check 'eye icon sits in the system status area' \
     grep -qE '^ {12}StIcon .*icon=view-reveal-symbolic' <("$D" tree panel | sed -n '/QuickSettings/,$p')

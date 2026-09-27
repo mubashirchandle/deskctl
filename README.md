@@ -157,7 +157,8 @@ NetworkManager, Bluetooth, power and accounts changes affect the machine. There 
 user session or portal inside, so Flatpak apps and portal-dependent features won't work there.
 The sandbox runs its own accessibility bus and registry (not `at-spi-bus-launcher`, which would
 start services through your real systemd session) and points its apps at it with
-`AT_SPI_BUS_ADDRESS`.
+`AT_SPI_BUS_ADDRESS`. Chromium and Electron apps register there but never answer, so `a11y`
+doesn't work for them in the sandbox.
 
 ## How it works
 

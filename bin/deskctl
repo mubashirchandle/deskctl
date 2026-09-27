@@ -1118,6 +1118,11 @@ A11Y_LAYOUT_ROLES = {
 }
 A11Y_STATES = ('focused', 'checked', 'indeterminate', 'selected', 'pressed', 'expanded',
                'collapsed', 'editable', 'modal')
+# Only these roles have values worth showing; LibreOffice gives every button one.
+A11Y_VALUE_ROLES = {'slider', 'spin button', 'progress bar', 'scroll bar', 'level bar', 'dial'}
+# Window types holding an app's menus and popovers (GTK4 popovers are separate surfaces).
+A11Y_POPUP_TYPES = {'dropdown_menu', 'popup_menu', 'combo', 'menu', 'tooltip'}
+A11Y_OUTLINE_DESC = 80
 MAX_A11Y_NODES = 5000
 A11Y_TREE_TEXT = 100
 A11Y_FULL_TEXT = 4000
@@ -1210,13 +1215,17 @@ def a11y_origin(box, window):
 class A11yWindow:
     """One window's accessibility tree, with extents mapped to stage coordinates."""
 
-    def __init__(self, Atspi, window):
+    def __init__(self, Atspi, window, popups=(), scale=1):
         self.Atspi = Atspi
         self.window = window
+        self.popups = [w[key] for w in popups for key in ('rect', 'buffer_rect')]
+        self.scale = scale
         self.frame = self._match_frame()
         if self.frame is None:
-            raise DeskctlError(f'Window {window["id"]} ({window["title"]!r}) has no accessibility '
-                               'tree; its app may not support AT-SPI', EXIT_NOT_FOUND)
+            raise DeskctlError(
+                f'Window {window["id"]} ({window["title"]!r}) has no accessibility tree; its app '
+                'may not support AT-SPI (Chromium and Electron apps expose one only when started '
+                'with ACCESSIBILITY_ENABLED=1 in their environment)', EXIT_NOT_FOUND)
         self.origin = a11y_origin(_extents(Atspi, self.frame) or (0, 0, 0, 0), window)
 
     def _match_frame(self):
@@ -1253,6 +1262,18 @@ class A11yWindow:
         states = self._safe(node.get_state_set)
         return {s.value_nick for s in states.get_states()} if states else set()
 
+    @staticmethod
+    def _map(box, mapping):
+        ax, ay, bx, by, k = mapping
+        return ax + (box[0] - bx) / k, ay + (box[1] - by) / k
+
+    def _inside(self, rect):
+        """Whether RECT's center lies in the window (not scrolled out of view)."""
+        frame = self.window['rect']
+        x, y = rect[0] + rect[2] / 2, rect[1] + rect[3] / 2
+        return (frame['x'] <= x < frame['x'] + frame['width'] and
+                frame['y'] <= y < frame['y'] + frame['height'])
+
     def _label(self, node):
         """The text of the labels naming an unnamed node (GTK4 menu items)."""
         Atspi = self.Atspi
@@ -1277,8 +1298,9 @@ class A11yWindow:
         role = self._safe(node.get_role_name, 'unknown')
         info = {'role': role, 'name': (self._safe(node.get_name) or '').strip() or self._label(node)}
         box = _extents(Atspi, node)
-        if box and box[2] > 0 and box[3] > 0:
-            info['rect'] = [box[0] + self.origin[0], box[1] + self.origin[1], box[2], box[3]]
+        # Nodes without a position report sizes of 0 or coordinates near INT_MIN.
+        valid = box and box[2] > 0 and box[3] > 0 and max(map(abs, box[:2])) < 1_000_000
+        info['_box'] = box if valid else None
         states = self._states(node)
         info['states'] = [s for s in A11Y_STATES if s in states]
         if 'expandable' not in states:
@@ -1295,9 +1317,11 @@ class A11yWindow:
                 if node.get_text_iface():
                     count = Atspi.Text.get_character_count(node)
                     text = Atspi.Text.get_text(node, 0, min(count, text_limit + 1))
-                    if text and text.strip() != info['name']:
+                    # U+FFFC stands in for embedded children (Chromium).
+                    text = (text or '').replace('\ufffc', '')
+                    if text.strip() and text.strip() != info['name']:
                         info['text'] = _truncate(text, text_limit)
-                if node.get_value_iface():
+                if role in A11Y_VALUE_ROLES and node.get_value_iface():
                     info['value'] = Atspi.Value.get_current_value(node)
             except GLib.Error:
                 pass
@@ -1311,9 +1335,12 @@ class A11yWindow:
         self.visited = 0
         self.truncated = False
         self.nodes = {}  # id(info) -> accessible, for acting on a match
-        return self._walk(self.frame, include_hidden, text_limit, None)[0]
+        mapping = (self.origin[0], self.origin[1], 0, 0, 1)
+        return self._walk(self.frame, include_hidden, text_limit, None, None, mapping, False)[0]
 
-    def _walk(self, node, include_hidden, text_limit, parent_name):
+    def _walk(self, node, include_hidden, text_limit, parent_name, parent_box, mapping, approx):
+        """MAPPING (ax, ay, bx, by, k) turns extents into stage coordinates:
+        a + (extent - b) / k. APPROX marks subtrees whose extents are unreliable."""
         if self.visited >= MAX_A11Y_NODES:
             self.truncated = True
             return []
@@ -1321,9 +1348,29 @@ class A11yWindow:
         info = self.describe(node, text_limit)
         if not include_hidden and 'showing' not in info['_states'] and node is not self.frame:
             return []
+        box = info.pop('_box')
+        if box and parent_box and self.scale != 1 and all(
+                abs(box[i] - parent_box[i] * self.scale) <= 3 for i in (2, 3)):
+            # Chromium web content: offsets inside count device pixels.
+            k = self.scale
+            px, py = self._map(parent_box, mapping)
+            mapping = (px + (box[0] - parent_box[0]) / k, py + (box[1] - parent_box[1]) / k,
+                       box[0], box[1], k)
+        if box and node is not self.frame and any(_same_size(box, r) for r in self.popups):
+            # GTK4 reports popover contents several pixels off; clicks use actions there.
+            info['states'].append('popup')
+            approx = True
+        if box:
+            x, y = self._map(box, mapping)
+            info['rect'] = [round(x), round(y), round(box[2] / mapping[4]), round(box[3] / mapping[4])]
+            if approx:
+                info['approx'] = True
+            elif not self._inside(info['rect']):
+                info['states'].append('offscreen')
         children = []
         for child in _children(node):
-            children += self._walk(child, include_hidden, text_limit, info['name'] or parent_name)
+            children += self._walk(child, include_hidden, text_limit, info['name'] or parent_name,
+                                   box or parent_box, mapping, approx)
         info.pop('_states')
         self.nodes[id(info)] = info.pop('_node')
         if not info['states']:
@@ -1332,7 +1379,7 @@ class A11yWindow:
         if node is not self.frame and not include_hidden:
             if plain and info['role'] in A11Y_LAYOUT_ROLES:
                 return children
-            if (info['role'] == 'label' and not children and info['name'] == parent_name
+            if (info['role'] == 'label' and not children and info['name'] in ('', parent_name)
                     and 'text' not in info):
                 return []
         if children:
@@ -1351,33 +1398,46 @@ A11Y_DIALOG_ROLES = {'dialog', 'alert'}
 
 
 def a11y_scope(root):
-    """The last dialog inside the window (an in-window sheet or popover covers
-    everything else), or the whole window."""
-    dialogs = [n for n in flatten_a11y(root) if n['role'] in A11Y_DIALOG_ROLES and n is not root]
-    return dialogs[-1] if dialogs else root
+    """What covers the rest of the window: the last open popover, else the
+    last in-window dialog, else the whole window."""
+    nodes = [n for n in flatten_a11y(root) if n is not root]
+    popups = [n for n in nodes if 'popup' in n.get('states', [])]
+    dialogs = [n for n in nodes if n['role'] in A11Y_DIALOG_ROLES]
+    return (popups or dialogs or [root])[-1]
 
 
-def a11y_matches(nodes, name=None, role=None, regex=False):
-    """Nodes whose name (exact, ignoring case; or a regex search) and role match.
-    Unnamed nodes match on their text or their description's first line."""
-    def norm(text):
-        return ' '.join(text.replace('-', ' ').replace('_', ' ').split()).casefold()
+def _norm(text):
+    return ' '.join(text.replace('-', ' ').replace('_', ' ').split()).casefold()
+
+
+def _labels(node):
+    # Icon-only buttons and bare fields are known by their tooltip's first line.
+    return [node['name']] if node['name'] else [
+        node.get('text', ''), node.get('description', '').split('\n')[0]]
+
+
+def a11y_matches(scope, name=None, role=None, regex=False):
+    """Nodes under SCOPE (not SCOPE itself) whose name (exact, ignoring case;
+    or a regex search) and role match. Unnamed nodes match on their text or
+    their description's first line. A match wrapping a same-named match (a
+    switch row around its switch) gives way to the inner, actual control."""
     pattern = re.compile(name, re.I) if name is not None and regex else None
     found = []
-    for node in nodes:
-        if role is not None and norm(node['role']) != norm(role):
+    for node in list(flatten_a11y(scope))[1:]:
+        if role is not None and _norm(node['role']) != _norm(role):
             continue
         if name is not None:
-            # Icon-only buttons and bare fields are known by their tooltip's first line.
-            labels = [node['name']] if node['name'] else [
-                node.get('text', ''), node.get('description', '').split('\n')[0]]
+            labels = _labels(node)
             if pattern:
                 if not any(pattern.search(label) for label in labels):
                     continue
-            elif norm(name) not in map(norm, labels):
+            elif _norm(name) not in map(_norm, labels):
                 continue
         found.append(node)
-    return found
+    ids = {id(n) for n in found}
+    return [n for n in found if not any(
+        id(inner) in ids and _norm(_labels(inner)[0]) == _norm(_labels(n)[0])
+        for inner in list(flatten_a11y(n))[1:])]
 
 
 def render_a11y(node, depth=0, lines=None):
@@ -1387,14 +1447,15 @@ def render_a11y(node, depth=0, lines=None):
         parts.append(json.dumps(node['name'], ensure_ascii=False))
     if node.get('rect'):
         x, y, w, h = node['rect']
-        parts.append(f'[{x},{y} {w}x{h}]')
+        parts.append(f"[{'~' if node.get('approx') else ''}{x},{y} {w}x{h}]")
     parts += node.get('states', [])
     if 'text' in node:
         parts.append('text=' + json.dumps(node['text'], ensure_ascii=False))
     if 'value' in node:
         parts.append(f"value={node['value']:g}")
     if node.get('description'):
-        parts.append('desc=' + json.dumps(node['description'], ensure_ascii=False))
+        parts.append('desc=' + json.dumps(_truncate(node['description'], A11Y_OUTLINE_DESC),
+                                          ensure_ascii=False))
     lines.append('  ' * depth + ' '.join(parts))
     for child in node.get('children', []):
         render_a11y(child, depth + 1, lines)
@@ -1411,7 +1472,10 @@ def _a11y_window(target, args, action):
         window = next((w for w in windows if str(w['id']) == args.window), None)
         if not window:
             raise DeskctlError(f'No window with id {args.window}', EXIT_NOT_FOUND)
-    return A11yWindow(_atspi_for(target), window)
+    popups = [w for w in windows if w['pid'] == window['pid'] and w['type'] in A11Y_POPUP_TYPES]
+    monitors = target.state()['monitors']
+    scale = next((m['scale'] for m in monitors if m['index'] == window['monitor']), 1)
+    return A11yWindow(_atspi_for(target), window, popups, scale)
 
 
 def _center(node):
@@ -1464,47 +1528,90 @@ def cmd_a11y(target, args):
         return
     if args.name is None and args.role is None:
         raise DeskctlError('Give --name, --role or both', EXIT_USAGE)
-    root = tree.walk(text_limit=A11Y_FULL_TEXT)
-    nodes = a11y_matches(flatten_a11y(root if args.anywhere else a11y_scope(root)),
-                         args.name, args.role, args.regex)
     if action == 'find':
-        emit_list(_found(nodes))
+        emit_list(_found(_a11y_find(tree, args)))
         return
     # click
     if args.action and (args.double or args.hold or args.button != 'left'):
         raise DeskctlError('--action performs the control\'s own action; it takes no '
                            '--double, --hold or --button', EXIT_USAGE)
-    clickable = nodes if args.action else [n for n in nodes if n.get('rect')]
-    if args.nth is not None:
-        if not 1 <= args.nth <= len(clickable):
-            raise DeskctlError(f'--nth {args.nth} but {len(clickable)} match', EXIT_NOT_FOUND)
-        clickable = [clickable[args.nth - 1]]
-    if not clickable:
-        raise DeskctlError('No visible match; check `deskctl a11y find`', EXIT_NOT_FOUND)
-    if len(clickable) > 1:
-        listing = '\n'.join(f'  {i}: {n["role"]} {n["name"]!r} {n["rect"]}'
-                            for i, n in enumerate(clickable[:10], 1))
-        raise DeskctlError(f'{len(clickable)} matches; narrow with --role or pick with --nth:\n'
-                           + listing, EXIT_USAGE)
-    node = clickable[0]
-    if args.action:
-        emit(_do_action(tree, node))
+    node = _a11y_pick(tree, args)
+    plain = not (args.double or args.hold or args.button != 'left')
+    if args.action or (node.get('approx') and plain and _has_action(tree, node)):
+        result = _do_action(tree, node)
+        if not args.action:
+            result['why'] = 'position is approximate (popover); used the control\'s action'
+        emit(result)
         if not args.no_settle:
             target.settle()
         return
-    x, y = _center(node)
-    frame = tree.window['rect']
-    if not (frame['x'] <= x < frame['x'] + frame['width'] and
-            frame['y'] <= y < frame['y'] + frame['height']):
-        raise DeskctlError(f'{node["role"]} {node["name"]!r} is outside its window '
-                           '(scrolled out of view?)', EXIT_FAILED)
+    if 'offscreen' in node.get('states', []):
+        tree, node = _scroll_into_view(target, args, tree, node)
     if not tree.window['focused']:
         target.call('WindowAction', '(tsa{sv})', (tree.window['id'], 'focus', {}))
         target.settle()
+    x, y = _center(node)
     _pointer(target, 'click', {'x': x, 'y': y, 'button': args.button,
                                'count': 2 if args.double else 1,
                                'hold': parse_hold(args.hold)}, not args.no_settle)
 
+
+def _a11y_find(tree, args):
+    root = tree.walk(text_limit=A11Y_FULL_TEXT)
+    return a11y_matches(root if args.anywhere else a11y_scope(root),
+                        args.name, args.role, args.regex)
+
+
+def _a11y_pick(tree, args):
+    """The one match to click: with a position unless --action, or the --nth."""
+    nodes = [n for n in _a11y_find(tree, args) if args.action or n.get('rect')]
+    if args.nth is not None:
+        if not 1 <= args.nth <= len(nodes):
+            raise DeskctlError(f'--nth {args.nth} but {len(nodes)} match', EXIT_NOT_FOUND)
+        nodes = [nodes[args.nth - 1]]
+    if not nodes:
+        raise DeskctlError('No visible match; check `deskctl a11y find`', EXIT_NOT_FOUND)
+    if len(nodes) > 1:
+        listing = '\n'.join(f'  {i}: {n["role"]} {n["name"]!r} {n.get("rect")}'
+                            for i, n in enumerate(nodes[:10], 1))
+        raise DeskctlError(f'{len(nodes)} matches; narrow with --role or pick with --nth:\n'
+                           + listing, EXIT_USAGE)
+    return nodes[0]
+
+
+
+def _scroll_into_view(target, args, tree, node, attempts=10):
+    """Ask the app to scroll NODE into view; failing that (GTK4 ignores the
+    request), turn the wheel at the window point nearest to it, which lies in
+    the same scrolled list."""
+    try:
+        tree.Atspi.Component.scroll_to(tree.nodes[id(node)], tree.Atspi.ScrollType.ANYWHERE)
+    except GLib.Error:
+        pass
+    for _ in range(attempts + 1):
+        target.settle()
+        tree = _a11y_window(target, args, 'click')
+        node = _a11y_pick(tree, args)
+        if 'offscreen' not in node.get('states', []):
+            return tree, node
+        frame = tree.window['rect']
+        x, y = _center(node)
+        inside_x = min(max(x, frame['x'] + 20), frame['x'] + frame['width'] - 20)
+        inside_y = min(max(y, frame['y'] + 60), frame['y'] + frame['height'] - 20)
+        steps = {'dy': 3 if y > inside_y else -3 if y < inside_y else 0,
+                 'dx': 3 if x > inside_x else -3 if x < inside_x else 0}
+        target.call('Pointer', '(sa{sv})', ('scroll', {
+            'x': GLib.Variant('d', inside_x), 'y': GLib.Variant('d', inside_y),
+            **{k: GLib.Variant('i', v) for k, v in steps.items()}}))
+    raise DeskctlError(f'{node["role"]} {node["name"]!r} is still out of view after scrolling; '
+                       'scroll to it first', EXIT_FAILED)
+
+def _has_action(tree, node):
+    accessible = tree.nodes[id(node)]
+    try:
+        return bool(accessible.get_action_iface()) and tree.Atspi.Action.get_n_actions(accessible) > 0
+    except GLib.Error:
+        return False
 
 def cmd_diff(target, args):
     a, b = Path(args.a), Path(args.b)

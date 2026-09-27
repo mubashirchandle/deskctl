@@ -108,18 +108,25 @@ deskctl a11y find --role 'check box' --name Wrap   # JSON with rect, center, sta
 deskctl a11y focus                                 # where keys will go, with its text
 ```
 
-- `--name` matches the whole name (or text) ignoring case; `--regex` searches instead. Several
-  matches make `click` fail with a numbered list; narrow with `--role` or pick with `--nth N`.
-- While a dialog is open inside the window, `find` and `click` search only that dialog (it covers
-  the rest); `--anywhere` searches everything.
+- `--name` matches the whole name ignoring case; unnamed controls match on their text or their
+  tooltip's first line. `--regex` searches instead. Several matches make `click` fail with a
+  numbered list; narrow with `--role` or pick with `--nth N`. A control wrapped in a same-named
+  container (a switch row and its switch) counts once, as the inner control.
+- While a popover or an in-window dialog is open, `find` and `click` search only it (it covers the
+  rest); `--anywhere` searches everything.
+- Controls scrolled out of view are marked `offscreen`; `click` scrolls them into view first.
 - Run `a11y focus` before `key` or `type` when unsure where keyboard focus is: after typing into
   a field, shortcuts go to that field.
-- Positions inside popup menus and popovers can be off by several pixels (a GTK limitation).
-  Clicking a normal-size item still lands; for small targets there use `click --action`, which
-  runs the control's own action (click, activate, toggle) without the pointer.
+- Popovers and popup menus are marked `popup`, and positions inside them are approximate
+  (`[~x,y ...]`, `"approx": true`): GTK4 reports them several pixels off. `click` there runs the
+  control's own action (click, activate, toggle) instead of the pointer; `--action` does that
+  anywhere.
 - Password fields show `text="(hidden)"`.
 - Custom-drawn areas (canvases, games, video) and apps without accessibility support have no
-  useful tree; use screenshots there. Qt and Electron apps may need accessibility enabled.
+  useful tree; use screenshots there.
+- Chromium and Electron apps (VS Code, Chrome, Slack…) expose a tree only when started with
+  `ACCESSIBILITY_ENABLED=1` in their environment, and only on the live session: in the sandbox
+  they register but never answer.
 
 ## Sandbox: a disposable GNOME Shell
 
