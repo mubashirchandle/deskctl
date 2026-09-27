@@ -1016,8 +1016,16 @@ def cmd_type(target, args):
     emit(result)
 
 
+POINTER_TYPES = {'x': 'd', 'y': 'd', 'button': 's', 'hold': 'as'}
+
+
+def parse_hold(combo):
+    """--hold ctrl+shift -> ['Control_L', 'Shift_L']."""
+    return None if combo is None else parse_combo(combo)
+
+
 def _pointer(target, action, options, settle):
-    variants = {k: GLib.Variant('d' if k in ('x', 'y') else ('s' if k == 'button' else 'i'), v)
+    variants = {k: GLib.Variant(POINTER_TYPES.get(k, 'i'), v)
                 for k, v in options.items() if v is not None}
     result = target.call('Pointer', '(sa{sv})', (action, variants))
     if settle:
@@ -1027,7 +1035,8 @@ def _pointer(target, action, options, settle):
 
 def cmd_click(target, args):
     _pointer(target, 'click', {'x': args.x, 'y': args.y, 'button': args.button,
-                               'count': 2 if args.double else args.count}, not args.no_settle)
+                               'count': 2 if args.double else args.count,
+                               'hold': parse_hold(args.hold)}, not args.no_settle)
 
 
 def cmd_move(target, args):
@@ -1037,10 +1046,13 @@ def cmd_move(target, args):
 def cmd_drag(target, args):
     (x1, y1), (x2, y2) = args.start, args.end
     button = {'button': GLib.Variant('s', args.button)}
+    hold = parse_hold(args.hold)
+    # The extension keeps these keys down until the release below.
+    press = {**button, 'hold': GLib.Variant('as', hold)} if hold else button
 
     def point(x, y):
         return {'x': GLib.Variant('d', x), 'y': GLib.Variant('d', y)}
-    target.call('Pointer', '(sa{sv})', ('press', {**point(x1, y1), **button}))
+    target.call('Pointer', '(sa{sv})', ('press', {**point(x1, y1), **press}))
     try:
         # Intermediate motion lets drag thresholds and hover effects trigger.
         for step in range(1, args.steps + 1):
@@ -1055,7 +1067,8 @@ def cmd_drag(target, args):
 
 def cmd_scroll(target, args):
     at = {'x': args.at[0], 'y': args.at[1]} if args.at else {}
-    _pointer(target, 'scroll', {**at, 'dx': args.dx, 'dy': args.dy}, not args.no_settle)
+    _pointer(target, 'scroll', {**at, 'dx': args.dx, 'dy': args.dy,
+                                'hold': parse_hold(args.hold)}, not args.no_settle)
 
 
 def cmd_tree(target, args):
@@ -1278,6 +1291,7 @@ def build_parser():
     p.add_argument('--button', choices=['left', 'middle', 'right'], default='left')
     p.add_argument('--double', action='store_true')
     p.add_argument('--count', type=int, default=1, choices=[1, 2, 3])
+    p.add_argument('--hold', metavar='KEYS', help='keys held while clicking, e.g. ctrl or ctrl+shift')
 
     p = sub.add_parser('move', parents=[settle], help='move the pointer to logical X Y')
     p.add_argument('x', type=float)
@@ -1288,11 +1302,13 @@ def build_parser():
     p.add_argument('end', type=float, nargs=2, metavar=('X2', 'Y2'))
     p.add_argument('--button', choices=['left', 'middle', 'right'], default='left')
     p.add_argument('--steps', type=positive_int, default=12)
+    p.add_argument('--hold', metavar='KEYS', help='keys held from press to release, e.g. ctrl or shift')
 
     p = sub.add_parser('scroll', parents=[settle], help='scroll wheel steps (positive = down/right)')
     p.add_argument('--dy', type=int, default=0)
     p.add_argument('--dx', type=int, default=0)
     p.add_argument('--at', type=float, nargs=2, metavar=('X', 'Y'), help='move there first')
+    p.add_argument('--hold', metavar='KEYS', help='keys held while scrolling, e.g. ctrl to zoom')
 
     p = sub.add_parser('tree', help='GNOME Shell actor tree as an outline (or --json)')
     p.add_argument('root', nargs='?', default='panel',

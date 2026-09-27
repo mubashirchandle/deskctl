@@ -70,6 +70,20 @@ check 'panel tree has the clock' grep -q '\.clock ' <("$D" tree panel)
 "$D" click 640 780 >/dev/null
 check 'pointer lands where clicked' jq -e '.pointer == {"x":640,"y":780}' <("$D" status)
 
+# Super+drag is mutter's window move, so it only works if super stays down throughout.
+"$D" window unmaximize focused >/dev/null
+focused_rect() { "$D" windows | jq -c '.[] | select(.focused) | .rect'; }
+read -r x y w h < <(focused_rect | jq -r '"\(.x) \(.y) \(.width) \(.height)"')
+cx=$((x + w / 2)) cy=$((y + h / 2))
+"$D" drag "$cx" "$cy" $((cx - 80)) $((cy + 40)) --hold super >/dev/null
+check 'drag --hold super moves the window' jq -e --argjson x "$x" --argjson y "$y" \
+    '(.x - ($x - 80) | fabs) <= 2 and (.y - ($y + 40) | fabs) <= 2' <(focused_rect)
+check 'held keys are released after the drag' jq -e '.held_input == {"keys":0,"buttons":0}' <("$D" status)
+read -r x y < <(focused_rect | jq -r '"\(.x) \(.y)"')
+"$D" drag $((cx - 80)) $((cy + 40)) "$cx" "$cy" >/dev/null
+check 'a plain drag leaves the window in place' jq -e --argjson x "$x" --argjson y "$y" \
+    '.x == $x and .y == $y' <(focused_rect)
+
 # Keep a window on workspace 1: GNOME deletes empty workspaces once you leave them.
 W=$(jq '.window.id' "$tmp/launch.json")
 "$D" launch org.gnome.Calculator --wait --timeout 30 >/dev/null
@@ -119,11 +133,11 @@ check 'switching off stops typing mid-way with exit 4' test "$(cat "$tmp/type.rc
 check 'the interrupted command says how far it got' grep -q 'stopped after [0-9]* of 300' "$tmp/type.err"
 check 'no key is left held' jq -e '.held_input == {"keys":0,"buttons":0}' <("$D" status)
 kill_switch true
-( "$D" drag 300 300 900 600 --steps 200 >/dev/null 2>&1 || true ) &
+( "$D" drag 300 300 900 600 --steps 200 --hold shift >/dev/null 2>&1 || true ) &
 sleep 0.6
 kill_switch false
 wait
-check 'switching off mid-drag releases the mouse button' \
+check 'switching off mid-drag releases the mouse button and held key' \
     jq -e '.held_input == {"keys":0,"buttons":0}' <("$D" status)
 kill_switch true
 

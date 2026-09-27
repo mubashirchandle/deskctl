@@ -43,6 +43,7 @@ export class Input {
         this._pointer = null;
         this._heldKeys = new Set();
         this._heldButtons = new Set();
+        this._pressHold = [];
         this._generation = 0;
     }
 
@@ -68,6 +69,7 @@ export class Input {
             this._pointer?.notify_button(now(), button, Clutter.ButtonState.RELEASED);
         this._heldKeys.clear();
         this._heldButtons.clear();
+        this._pressHold = [];
     }
 
     _device(type) {
@@ -164,59 +166,125 @@ export class Input {
         }
     }
 
+    _holdKeys(hold, action) {
+        if (hold === undefined)
+            return [];
+        if (!Array.isArray(hold) || hold.length === 0 || hold.length > MAX_COMBO_KEYS)
+            throw new DeskctlError('InvalidArgs', `Hold 1..${MAX_COMBO_KEYS} keys`);
+        if (action === 'move' || action === 'release')
+            throw new DeskctlError('InvalidArgs', `Keys can't be held for ${action}; hold them on press`);
+        return hold.map(keyval);
+    }
+
+    _buttonFor(args) {
+        const button = BUTTONS[args.button ?? 'left'];
+        if (!button)
+            throw new DeskctlError('InvalidArgs', `Button must be one of ${Object.keys(BUTTONS).join(', ')}`);
+        return button;
+    }
+
+    _scrollSteps(args) {
+        const steps = [
+            [args.dy ?? 0, Clutter.ScrollDirection.DOWN, Clutter.ScrollDirection.UP],
+            [args.dx ?? 0, Clutter.ScrollDirection.RIGHT, Clutter.ScrollDirection.LEFT],
+        ];
+        for (const [amount] of steps) {
+            if (!Number.isInteger(amount) || Math.abs(amount) > 100)
+                throw new DeskctlError('InvalidArgs', 'Scroll steps must be integers within ±100');
+        }
+        return steps;
+    }
+
+    _clickCount(args) {
+        const count = args.count ?? 1;
+        if (!Number.isInteger(count) || count < 1 || count > 3)
+            throw new DeskctlError('InvalidArgs', 'Click count must be 1..3');
+        return count;
+    }
+
+    async _pressKeys(values, generation) {
+        for (const value of values) {
+            this._key(value, true);
+            await this._step(KEY_GAP_MS, generation);
+        }
+    }
+
+    _releaseKeys(values) {
+        for (const value of [...values].reverse()) {
+            if (this._heldKeys.has(value))
+                this._key(value, false);
+        }
+    }
+
+    // `hold` keeps keys down around the action, e.g. Control_L for ctrl+click.
+    // A drag is press, moves and release in separate calls, so keys held on
+    // press stay down until the next release.
     async pointerAction(action, args) {
         const generation = this._generation;
+        // Validate everything before moving or pressing anything.
+        const hold = this._holdKeys(args.hold, action);
+        let run, button;
+        if (action === 'move') {
+            run = () => {};
+        } else if (action === 'scroll') {
+            const steps = this._scrollSteps(args);
+            run = () => this._scroll(steps, generation);
+        } else if (action === 'click') {
+            button = this._buttonFor(args);
+            const count = this._clickCount(args);
+            run = () => this._click(button, count, generation);
+        } else if (action === 'press' || action === 'release') {
+            button = this._buttonFor(args);
+        } else {
+            throw new DeskctlError('InvalidArgs', `Unknown pointer action ${action}`);
+        }
+
         if (args.x !== undefined || args.y !== undefined) {
             this._checkPoint(args.x, args.y);
             await this._moveTo(args.x, args.y, generation);
         }
-        if (action === 'move')
-            return this._position();
-
-        if (action === 'scroll') {
-            const steps = [
-                [args.dy ?? 0, Clutter.ScrollDirection.DOWN, Clutter.ScrollDirection.UP],
-                [args.dx ?? 0, Clutter.ScrollDirection.RIGHT, Clutter.ScrollDirection.LEFT],
-            ];
-            for (const [amount] of steps) {
-                if (!Number.isInteger(amount) || Math.abs(amount) > 100)
-                    throw new DeskctlError('InvalidArgs', 'Scroll steps must be integers within ±100');
-            }
-            for (const [amount, positive, negative] of steps) {
-                for (let i = 0; i < Math.abs(amount); i++) {
-                    this.pointer.notify_discrete_scroll(now(), amount > 0 ? positive : negative,
-                        Clutter.ScrollSource.WHEEL);
-                    await this._step(KEY_GAP_MS, generation);
-                }
-            }
-            return this._position();
-        }
-
-        const button = BUTTONS[args.button ?? 'left'];
-        if (!button)
-            throw new DeskctlError('InvalidArgs', `Button must be one of ${Object.keys(BUTTONS).join(', ')}`);
         if (action === 'press') {
+            await this._pressKeys(hold, generation);
+            this._pressHold.push(...hold);
             this._button(button, true);
         } else if (action === 'release') {
             this._button(button, false);
-        } else if (action === 'click') {
-            const count = args.count ?? 1;
-            if (!Number.isInteger(count) || count < 1 || count > 3)
-                throw new DeskctlError('InvalidArgs', 'Click count must be 1..3');
-            for (let i = 0; i < count; i++) {
-                this._button(button, true);
-                try {
-                    await this._step(KEY_GAP_MS, generation);
-                } finally {
-                    if (generation === this._generation)
-                        this._button(button, false);
-                }
-                await this._step(KEY_GAP_MS * 3, generation);
-            }
+            this._releaseKeys(this._pressHold);
+            this._pressHold = [];
         } else {
-            throw new DeskctlError('InvalidArgs', `Unknown pointer action ${action}`);
+            await this._pressKeys(hold, generation);
+            try {
+                await run();
+            } finally {
+                if (generation === this._generation)
+                    this._releaseKeys(hold);
+            }
         }
-        return this._position();
+        const [x, y] = global.get_pointer();
+        return {pointer: {x, y}};
+    }
+
+    async _scroll(steps, generation) {
+        for (const [amount, positive, negative] of steps) {
+            for (let i = 0; i < Math.abs(amount); i++) {
+                this.pointer.notify_discrete_scroll(now(), amount > 0 ? positive : negative,
+                    Clutter.ScrollSource.WHEEL);
+                await this._step(KEY_GAP_MS, generation);
+            }
+        }
+    }
+
+    async _click(button, count, generation) {
+        for (let i = 0; i < count; i++) {
+            this._button(button, true);
+            try {
+                await this._step(KEY_GAP_MS, generation);
+            } finally {
+                if (generation === this._generation)
+                    this._button(button, false);
+            }
+            await this._step(KEY_GAP_MS * 3, generation);
+        }
     }
 
     // A new virtual pointer can drop an axis of its first absolute motion,
@@ -230,10 +298,5 @@ export class Input {
                 return;
         }
         throw new DeskctlError('Failed', `Pointer did not reach ${x},${y}`);
-    }
-
-    _position() {
-        const [x, y] = global.get_pointer();
-        return {pointer: {x, y}};
     }
 }

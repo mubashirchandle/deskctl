@@ -86,6 +86,10 @@ class ArgumentTests(unittest.TestCase):
         with self.assertRaises(SystemExit), mock.patch('sys.stderr'):
             parser.parse_args(['screenshot', '--monitor', '0', '--window', 'focused'])
 
+    def test_hold_parses_keys(self):
+        args = deskctl.build_parser().parse_args(['drag', '1', '2', '3', '4', '--hold', 'ctrl+shift'])
+        self.assertEqual(deskctl.parse_hold(args.hold), ['Control_L', 'Shift_L'])
+        self.assertIsNone(deskctl.parse_hold(None))
 
 class GridTests(unittest.TestCase):
     def test_lines_inside_capture(self):

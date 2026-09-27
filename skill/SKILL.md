@@ -63,7 +63,7 @@ than full screens.
 | Wait for window | `deskctl wait-window --app ID \| --title REGEX \| --wm-class C [--gone] [--timeout S]` |
 | Keys | `deskctl key super` · `deskctl key ctrl+alt+t` · `deskctl key super+Return Escape` |
 | Type | `deskctl type 'text' [--enter]` |
-| Pointer | `deskctl click X Y [--button right] [--double]` · `deskctl move X Y` · `deskctl drag X1 Y1 X2 Y2` · `deskctl scroll --dy 3 [--at X Y]` |
+| Pointer | `deskctl click X Y [--button right] [--double]` · `deskctl move X Y` · `deskctl drag X1 Y1 X2 Y2` · `deskctl scroll --dy 3 [--at X Y]` · add `--hold ctrl` (or `shift`, `ctrl+shift`, …) to `click`, `drag` or `scroll` to keep keys down throughout |
 | Shell UI as text | `deskctl tree panel\|quick-settings\|calendar\|dash\|overview\|message-tray\|ui\|stage [--depth N] [--all] [--json]` |
 | Settings diff | `deskctl settings snapshot [NAME]` · `deskctl settings diff [NAME] [--prefix /org/gnome/desktop/]` |
 | Shell logs | `deskctl mark` · `deskctl logs [--since-mark] [--since '5 min ago'] [--all]` |
@@ -81,6 +81,10 @@ right after them shows the final state.
   exact: style classes, labels, icon names, visibility and geometry. Popup menus are hidden until
   opened, so open them first (`deskctl click` on the button, or `deskctl key super+s` for
   Quick Settings), then `deskctl tree quick-settings`.
+- **Modifier + mouse:** `--hold` keeps keys down for the whole action: `click --hold ctrl` to add
+  to a selection, `drag --hold ctrl` to constrain a shape or angle in drawing apps,
+  `scroll --hold ctrl` to zoom, `drag --hold super` to move a window. Pressing `deskctl key ctrl`
+  first does not work, because the key is released before the click.
 - **Keybinding changed?** Press it with `deskctl key ...`, then check the effect with `status`,
   `windows` or a screenshot.
 - **Theme/colour work:** `deskctl pixel X Y` gives exact colours. `settings diff` confirms the
